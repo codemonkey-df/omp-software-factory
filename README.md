@@ -24,7 +24,7 @@ loads the TypeScript extension directly.
 `omp` to reload the extension). Turn it off with `omp plugin disable omp-sw-factory`
 (`omp plugin uninstall` needs `bun` on `PATH`).
 
-The pinned mode copies the skill, agents and command into `<repo>/.omp/` and the
+The pinned mode copies the skill and agents into `<repo>/.omp/` and the
 extension into `<repo>/.omp/extensions/sw-factory/`; commit them to share the factory
 with everyone who opens that repo in OMP.
 
@@ -50,6 +50,24 @@ cd ~/code/app && omp
 
 Each repo has its own `factory/` state, so separate OMP instances can run factories for
 different repos at the same time.
+
+### Discovering commands
+
+- Type `/factory ` (with the space) to get a dropdown of subcommands with their arguments
+  and descriptions. After `approve`, `rework` or `done` it offers the matching job ids.
+- Type `/fx` to list the short forms, one per subcommand, e.g.:
+
+  ```text
+  /fx:init                      Set up the factory here: base branch, merge or branch mode, repo profile
+  /fx:feature <request> [@base] Queue a feature job
+  /fx:bugfix  <request> [@base] Queue a bugfix job
+  /fx:dash                      Serve the live dashboard
+  /fx:rework  <job-id> <note>   Send a job back to its builder with a note
+  ```
+
+- `/factory` alone (or `/fx:help`) prints the full list.
+
+`/fx:bugfix crash on save` is the same as `/factory bugfix: crash on save`.
 
 ## Branches and integration
 
@@ -88,9 +106,9 @@ why the default puts the type first. `/factory` tells you when a pattern clashes
 
 | Path | What |
 |---|---|
-| `commands/factory.md` | the `/factory` slash command (loads the skill) |
 | `skills/factory/SKILL.md` | the orchestrator's loop: edit this to change the factory |
 | `src/index.ts` | OMP extension: registers the `factory` tool (main session only; subagents are refused) |
+| `src/commands.ts` | the `/factory` and `/fx:*` slash commands: subcommand list, autocomplete, help |
 | `src/factory.ts` | the exact work behind it: board.json, ids, branch names, worktrees, ports, rounds, serial integration |
 | `src/cli.ts` | the same actions from a shell, for debugging: `node src/cli.ts status` |
 | `templates/` | `dashboard.html`, `backlog.md`, the `AGENTS.md` section |

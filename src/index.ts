@@ -1,6 +1,7 @@
-/** OMP extension: registers the `factory` tool used by the /factory orchestrator. */
+/** OMP extension: the `factory` tool used by the orchestrator, and the /factory, /fx:* commands. */
 
 import { ACTIONS, type ActionParams, runAction } from "./actions.ts";
+import { registerCommands } from "./commands.ts";
 import { FactoryError, INTEGRATIONS, JOB_TYPES } from "./factory.ts";
 import type { ExtensionAPI, ToolResult } from "./omp-types.ts";
 
@@ -36,6 +37,7 @@ const text = (value: unknown): ToolResult => ({
 export default function factoryExtension(pi: ExtensionAPI): void {
   const z = pi.zod;
   pi.setLabel("Software factory");
+  registerCommands(pi);
   pi.registerTool<ActionParams>({
     name: "factory",
     label: "Factory",

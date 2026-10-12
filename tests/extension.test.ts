@@ -18,7 +18,13 @@ const zod: ZodLike = {
 
 function load(): ToolDefinition<any> {
   const tools: ToolDefinition<any>[] = [];
-  const pi: ExtensionAPI = { zod, setLabel: () => {}, registerTool: (tool) => tools.push(tool) };
+  const pi: ExtensionAPI = {
+    zod,
+    setLabel: () => {},
+    registerTool: (tool) => tools.push(tool),
+    registerCommand: () => {},
+    sendUserMessage: () => {},
+  };
   factoryExtension(pi);
   assert.equal(tools.length, 1);
   return tools[0]!;

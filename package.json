@@ -6,7 +6,7 @@
   "license": "MIT",
   "type": "module",
   "keywords": ["omp", "oh-my-pi", "skill", "openspec", "worktree"],
-  "files": ["agents", "commands", "skills", "src", "templates", "README.md"],
+  "files": ["agents", "skills", "src", "templates", "README.md"],
   "engines": { "node": ">=23.6" },
   "omp": {
     "extensions": ["./src/index.ts"]

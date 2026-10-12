@@ -54,7 +54,7 @@ shows the config under `repo`:
 | `/factory approve <id>` | `factory(enqueue, id)` (needs-human → integration queue), then run the scheduler |
 | `/factory rework <id> <note>` | [Rework](#rework), then run the scheduler |
 | `/factory done <id>` | A human merged a `ready` branch (e.g. squash-merged a PR): `factory(set, id, stage: "merged")`, then `factory(cleanup)` |
-| `/factory status` | `factory(status)`, summarise as a short table (id, type, stage, branch → base) |
+| `/factory status` | `factory(status)`, summarise as a short table (id, type, stage, branch → base). Next steps you may suggest: `approve` only for needs-human jobs; for `ready` jobs, the user merges the branch, then `done <id>` (or `rework <id> <note>`) |
 | `/factory dashboard` | Start `python3 -m http.server 8765` in ROOT as a named background bash service (or `npx serve -l 8765` without Python); give the user `http://localhost:8765/factory/dashboard.html` |
 | `/factory cleanup` | `factory(cleanup)`: also marks `ready` jobs whose branch is already in its base as merged |
 

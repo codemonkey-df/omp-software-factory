@@ -41,8 +41,30 @@ export interface ToolDefinition<P> {
   ): Promise<ToolResult>;
 }
 
+export interface CompletionItem {
+  label: string;
+  /** Replaces everything typed after the command name. */
+  value: string;
+  description?: string;
+}
+
+export interface CommandContext {
+  cwd: string;
+  hasUI?: boolean;
+  ui: { notify(message: string, level?: "info" | "warning" | "error"): void };
+}
+
+export interface CommandDefinition {
+  description: string;
+  getArgumentCompletions?: (typed: string) => CompletionItem[] | null | Promise<CompletionItem[] | null>;
+  handler(args: string, ctx: CommandContext): void | Promise<void>;
+}
+
 export interface ExtensionAPI {
   zod: ZodLike;
   setLabel(label: string): void;
   registerTool<P>(tool: ToolDefinition<P>): void;
+  registerCommand(name: string, command: CommandDefinition): void;
+  /** Send text as if the user typed it; starts a turn (or steers a running one). */
+  sendUserMessage(text: string): void;
 }
