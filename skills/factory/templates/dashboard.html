@@ -1,0 +1,207 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Software factory</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root { --bg:#f6f7f9; --card:#fff; --ink:#1c2230; --muted:#6b7385; --line:#e3e6ec;
+          --pass:#1f9d55; --changes:#d97706; --pending:#c4c9d4; --human:#dc2626; --accent:#4f46e5; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#12151c; --card:#1b1f29; --ink:#e6e9ef; --muted:#8b93a7; --line:#2a303d; --pending:#3a4152; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; font:14px/1.4 system-ui, sans-serif; background:var(--bg); color:var(--ink); }
+  header { display:flex; align-items:baseline; gap:16px; padding:16px 20px 8px; }
+  header h1 { margin:0; font-size:18px; }
+  header .meta { color:var(--muted); font-size:12px; }
+  .lane { margin:8px 20px; padding:10px 12px; border:1px solid var(--line); border-radius:10px;
+          background:var(--card); display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+  .lane b { font-size:12px; text-transform:uppercase; letter-spacing:.04em; color:var(--muted); margin-right:6px; }
+  [hidden] { display:none !important; }
+  .lane.human { border-color:var(--human); }
+  .lane.human b { color:var(--human); }
+  .pill { padding:2px 8px; border-radius:999px; border:1px solid var(--line); font-size:12px; cursor:pointer; }
+  .pill.next { border-color:var(--accent); color:var(--accent); font-weight:600; }
+  .board { display:grid; grid-template-columns:repeat(8, minmax(170px, 1fr)); gap:10px; padding:8px 20px 24px; overflow-x:auto; }
+  .col h2 { font-size:12px; text-transform:uppercase; letter-spacing:.04em; color:var(--muted); margin:6px 2px 8px; }
+  .col h2 span { float:right; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:10px; margin-bottom:8px; cursor:pointer; }
+  .card:hover { border-color:var(--accent); }
+  .card.human { border:2px solid var(--human); }
+  .card .id { font-weight:600; font-size:13px; word-break:break-word; }
+  .card .sub { color:var(--muted); font-size:11px; margin-top:2px; font-family:ui-monospace, monospace; }
+  .card .note { color:var(--human); font-size:11px; margin-top:4px; }
+  .rounds { margin-top:8px; display:flex; flex-direction:column; gap:3px; }
+  .round { display:flex; gap:3px; align-items:center; font-size:10px; color:var(--muted); }
+  .round .n { width:22px; }
+  .chip { flex:1; text-align:center; padding:1px 0; border-radius:4px; background:var(--pending); color:#fff; font-size:10px; }
+  .chip.PASS { background:var(--pass); } .chip.CHANGES { background:var(--changes); } .chip.INVALID { background:var(--human); }
+  aside { position:fixed; top:0; right:0; bottom:0; width:min(720px, 92vw); background:var(--card);
+          border-left:1px solid var(--line); box-shadow:-8px 0 24px rgba(0,0,0,.12); display:none; flex-direction:column; }
+  aside.open { display:flex; }
+  aside .top { padding:14px 16px; border-bottom:1px solid var(--line); display:flex; justify-content:space-between; gap:12px; }
+  aside .files { padding:8px 16px; display:flex; gap:6px; flex-wrap:wrap; border-bottom:1px solid var(--line); }
+  aside .files .pill.on { background:var(--accent); color:#fff; border-color:var(--accent); }
+  aside .doc { padding:8px 20px 40px; overflow:auto; }
+  aside .doc pre { background:var(--bg); padding:10px; border-radius:6px; overflow:auto; }
+  aside .doc code { font-family:ui-monospace, monospace; font-size:12px; }
+  button.x { border:0; background:none; color:var(--muted); font-size:20px; cursor:pointer; }
+  .err { color:var(--human); padding:8px 20px; }
+</style>
+</head>
+<body>
+<header><h1>Software factory</h1><div class="meta" id="meta">loading…</div></header>
+<div class="lane human" id="human" hidden></div>
+<div class="lane" id="queue"></div>
+<div class="err" id="err" hidden></div>
+<div class="board" id="board"></div>
+<aside id="drawer">
+  <div class="top"><div><div class="id" id="d-title"></div><div class="sub" id="d-sub"></div></div>
+    <button class="x" onclick="closeDrawer()">×</button></div>
+  <div class="files" id="d-files"></div>
+  <div class="doc" id="d-doc"></div>
+</aside>
+<script>
+const STAGES = ["queued","spec","build","review","approve","merge-queue","merged","needs-human"];
+const REVIEWERS = ["security","ux","ui","code"];
+const ROOT = "../";                     // dashboard lives in factory/, files are repo-root relative
+const verdictCache = new Map();          // finished-round verdicts never change
+let board = null, openJob = null, openFile = null;
+
+const esc = s => String(s).replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+
+async function fetchText(path) {
+  const r = await fetch(ROOT + path, {cache: "no-store"});
+  if (!r.ok) throw new Error(`${r.status} ${path}`);
+  return r.text();
+}
+
+async function pastVerdict(job, n, reviewer) {
+  const path = `factory/jobs/${job.id}/round-${n}/review-${reviewer}.md`;
+  if (verdictCache.has(path)) return verdictCache.get(path);
+  if (!job.files.includes(path)) return "pending";
+  try {
+    const first = (await fetchText(path)).split("\n").find(l => l.trim()) || "";
+    const v = (first.match(/PASS|CHANGES/) || ["INVALID"])[0];
+    verdictCache.set(path, v);
+    return v;
+  } catch { return "pending"; }
+}
+
+async function roundsHtml(job) {
+  let html = "";
+  for (let n = 1; n <= job.round; n++) {
+    const chips = [];
+    for (const r of REVIEWERS) {
+      const v = n === job.round ? (job.reviews[r] || "pending") : await pastVerdict(job, n, r);
+      chips.push(`<span class="chip ${v}" title="${r}: ${v}">${r}</span>`);
+    }
+    html += `<div class="round"><span class="n">R${n}</span>${chips.join("")}</div>`;
+  }
+  return html ? `<div class="rounds">${html}</div>` : "";
+}
+
+async function cardHtml(job) {
+  const human = job.stage === "needs-human";
+  return `<div class="card ${human ? "human" : ""}" onclick="openDrawer('${job.id}')">
+    <div class="id">${esc(job.id)}</div>
+    <div class="sub">${esc(job.branch)} · :${job.port}</div>
+    ${job.note ? `<div class="note">${esc(job.note)}</div>` : ""}
+    ${await roundsHtml(job)}</div>`;
+}
+
+async function render() {
+  const jobs = board.jobs;
+  document.getElementById("meta").textContent =
+    `${jobs.length} jobs · max_parallel ${board.max_parallel} · base ${board.repo?.main_branch ?? "main"} · updated ${new Date().toLocaleTimeString()}`;
+
+  const q = board.merge_queue;
+  document.getElementById("queue").innerHTML = `<b>Merge queue</b>` + (q.length
+    ? q.map((id, i) => `<span class="pill ${i === 0 ? "next" : ""}" onclick="openDrawer('${id}')">${i === 0 ? "next → " : ""}${esc(id)}</span>`).join("")
+    : `<span class="sub">empty</span>`);
+
+  const human = jobs.filter(j => j.stage === "needs-human");
+  const humanEl = document.getElementById("human");
+  humanEl.hidden = !human.length;
+  humanEl.innerHTML = `<b>Needs human</b>` + human.map(j =>
+    `<span class="pill" onclick="openDrawer('${j.id}')">${esc(j.id)} — ${esc(j.note || "escalated")}</span>`).join("");
+
+  const cols = [];
+  for (const stage of STAGES) {
+    const inStage = jobs.filter(j => j.stage === stage);
+    const cards = (await Promise.all(inStage.map(cardHtml))).join("");
+    cols.push(`<div class="col"><h2>${stage}<span>${inStage.length}</span></h2>${cards}</div>`);
+  }
+  document.getElementById("board").innerHTML = cols.join("");
+  if (openJob) renderDrawer();
+}
+
+function fileLabel(path) {
+  const parts = path.split("/");
+  const parent = parts[parts.length - 2] || "";
+  return parts.at(-1) === "spec.md" || parent.startsWith("round-") ? parts.slice(-2).join("/") : parts.at(-1);
+}
+
+function closeDrawer() { openJob = null; document.getElementById("drawer").classList.remove("open"); }
+function openDrawer(id) { openJob = id; openFile = null; renderDrawer(); document.getElementById("drawer").classList.add("open"); }
+
+function renderDrawer() {
+  const job = board.jobs.find(j => j.id === openJob);
+  if (!job) return closeDrawer();
+  document.getElementById("d-title").textContent = `${job.id} — ${job.title}`;
+  document.getElementById("d-sub").textContent = `${job.stage} · round ${job.round} · ${job.branch} · ${job.worktree} · :${job.port}`;
+  if (!openFile && job.files.length) openFile = job.files[0];
+  document.getElementById("d-files").innerHTML = job.files.map(f =>
+    `<span class="pill ${f === openFile ? "on" : ""}" title="${esc(f)}" onclick="showFile('${esc(f)}')">${esc(fileLabel(f))}</span>`
+  ).join("") || `<span class="sub">no files yet</span>`;
+  if (openFile) showFile(openFile, true);
+}
+
+async function showFile(path, quiet) {
+  openFile = path;
+  if (!quiet) renderDrawer();
+  const doc = document.getElementById("d-doc");
+  try { doc.innerHTML = `<div class="sub">${esc(path)}</div>` + md(await fetchText(path)); }
+  catch (e) { doc.innerHTML = `<p class="err">${esc(e.message)}</p>`; }
+}
+
+function md(src) {
+  const inline = s => esc(s).replace(/`([^`]+)`/g, "<code>$1</code>").replace(/\*\*([^*]+)\*\*/g, "<b>$1</b>");
+  const out = []; let code = null, list = false, para = [];
+  const flush = () => { if (para.length) out.push(`<p>${inline(para.join(" "))}</p>`); para = []; };
+  for (const line of src.split("\n")) {
+    if (line.startsWith("```")) { flush(); if (code !== null) { out.push(`<pre><code>${esc(code)}</code></pre>`); code = null; } else code = ""; continue; }
+    if (code !== null) { code += line + "\n"; continue; }
+    const li = line.match(/^\s*[-*] (\[( |x)\] )?(.*)/);
+    const h = line.match(/^(#{1,4}) (.*)/);
+    if (li || h || !line.trim()) flush();
+    if (li && !list) { out.push("<ul>"); list = true; }
+    if (list && !li && (h || !line.trim() || !/^\s/.test(line))) { out.push("</ul>"); list = false; }
+    if (h) out.push(`<h${h[1].length + 1}>${inline(h[2])}</h${h[1].length + 1}>`);
+    else if (li) out.push(`<li>${li[1] ? (li[2] === "x" ? "☑ " : "☐ ") : ""}${inline(li[3])}</li>`);
+    else if (list && line.trim()) out[out.length - 1] = out[out.length - 1].replace(/<\/li>$/, ` ${inline(line.trim())}</li>`);
+    else if (line.trim()) para.push(line.trim());
+  }
+  flush();
+  if (list) out.push("</ul>");
+  return out.join("\n");
+}
+
+async function poll() {
+  const err = document.getElementById("err");
+  try {
+    board = JSON.parse(await fetchText("factory/board.json"));
+    err.hidden = true;
+    if (!openJob && location.hash.length > 1) { openDrawer(decodeURIComponent(location.hash.slice(1))); history.replaceState(null, "", location.pathname); }
+    await render();
+  } catch (e) {
+    err.hidden = false;
+    err.textContent = `Cannot read board.json (${e.message}). Serve the repo root: python3 -m http.server, then open /factory/dashboard.html`;
+  }
+}
+document.addEventListener("keydown", e => { if (e.key === "Escape") closeDrawer(); });
+poll(); setInterval(poll, 2000);
+</script>
+</body>
+</html>
