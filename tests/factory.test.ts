@@ -62,7 +62,8 @@ describe("setup", () => {
   test("init creates state and is idempotent", async () => {
     await run(repo, "init", { skip_openspec: true });
     assert.equal(board(repo).max_parallel, 3);
-    assert.equal(board(repo).repo.main_branch, "main");
+    assert.equal(board(repo).repo.base_branch, "main");
+    assert.equal(board(repo).repo.integration, "merge");
     assert.ok(existsSync(join(repo, "factory", "dashboard.html")));
     assert.ok(existsSync(join(repo, "factory", "backlog.md")));
     assert.equal(readFileSync(join(repo, ".gitignore"), "utf8").split(".factory-worktrees/").length - 1, 1);
@@ -99,7 +100,7 @@ describe("jobs", () => {
     );
     const first = job(repo, ids[0]!);
     assert.equal(first.stage, "spec");
-    assert.equal(first.branch, `factory/${ids[0]}`);
+    assert.equal(first.branch, "feature/main/f0");
     assert.equal(first.port, 3001);
     assert.ok(existsSync(join(repo, first.worktree, "app.txt")));
     assert.equal(job(repo, ids[2]!).stage, "queued");
@@ -147,7 +148,7 @@ describe("merge queue", () => {
     assert.equal(job(repo, id).stage, "merged");
     assert.deepEqual(board(repo).merge_queue, []);
     assert.ok(!existsSync(join(repo, ".factory-worktrees", id)));
-    assert.ok(git(repo, "branch", "--list", `factory/${id}`));
+    assert.ok(git(repo, "branch", "--list", job(repo, id).branch));
     assert.equal(git(repo, "status", "--porcelain"), "");
   });
 
@@ -261,5 +262,197 @@ describe("merge queue", () => {
     const archived = job(repo, id).files.filter((f) => f.includes("/archive/"));
     assert.equal(archived.length, 1);
     assert.ok(existsSync(join(repo, archived[0]!)));
+  });
+});
+
+describe("branch naming", () => {
+  test("uses {type}/{base}/{slug} with the job type and base", async () => {
+    git(repo, "branch", "Branch_A");
+    await run(repo, "new", { title: "Login form" });
+    await run(repo, "new", { title: "Crash on save", type: "bugfix", base: "Branch_A" });
+    await run(repo, "new", { title: "Rename config", type: "change" });
+    await run(repo, "new", { title: "Fix token leak", type: "hotfix", base: "Branch_A" });
+    assert.deepEqual(
+      board(repo).jobs.map((j) => [j.type, j.base_branch, j.branch]),
+      [
+        ["feature", "main", "feature/main/login-form"],
+        ["bugfix", "Branch_A", "bugfix/Branch_A/crash-save"],
+        ["change", "main", "change/main/rename-config"],
+        ["hotfix", "Branch_A", "hotfix/Branch_A/fix-token-leak"],
+      ],
+    );
+  });
+
+  test("same slug gets a numeric suffix", async () => {
+    await run(repo, "new", { title: "Login form" });
+    assert.equal((await run(repo, "new", { title: "login form" })).branch, "feature/main/login-form-002");
+  });
+
+  test("custom pattern", async () => {
+    await run(repo, "profile", { branch_pattern: "factory/{id}" });
+    assert.equal((await run(repo, "new", { title: "x" })).branch, "factory/job-001-x");
+  });
+
+  test("a pattern nesting under the base branch itself is rejected", async () => {
+    await run(repo, "profile", { branch_pattern: "{base}/{id}" });
+    await assert.rejects(run(repo, "new", { title: "x" }), /branch "main" exists/);
+  });
+
+  test("explains a git branch/folder clash", async () => {
+    git(repo, "branch", "feature/main");
+    await assert.rejects(run(repo, "new", { title: "x" }), /branch "feature\/main" exists/);
+  });
+
+  test("rejects unknown type and missing base", async () => {
+    await assert.rejects(run(repo, "new", { title: "x", type: "chore" }), /unknown job type/);
+    await assert.rejects(run(repo, "new", { title: "x", base: "nope" }), /does not exist/);
+    await assert.rejects(run(repo, "profile", { integration: "yolo" }), /unknown integration/);
+  });
+
+  test("boards from older versions are upgraded on load", async () => {
+    const old = board(repo) as unknown as Record<string, any>;
+    old.repo = { main_branch: "main", base_port: 3000, install: "", test: "true", dev: "" };
+    writeFileSync(join(repo, "factory", "board.json"), JSON.stringify(old));
+    const status = await run(repo, "status");
+    assert.equal(status.repo.base_branch, "main");
+    assert.equal(status.repo.integration, "merge");
+  });
+});
+
+describe("integration modes", () => {
+  beforeEach(() => {
+    git(repo, "checkout", "-qb", "Branch_A");
+    writeFileSync(join(repo, "a.txt"), "parent work\n");
+    git(repo, "add", ".");
+    git(repo, "commit", "-qm", "Branch_A work");
+    git(repo, "checkout", "-q", "main");
+  });
+
+  test("merge mode stacks jobs onto a parent branch without touching main", async () => {
+    await run(repo, "profile", { base_branch: "Branch_A" });
+    const a = await newId(repo, "alpha");
+    const b = await newId(repo, "beta");
+    await run(repo, "start", { skip_install: true });
+    assert.ok(existsSync(join(repo, job(repo, a).worktree, "a.txt")));
+    builderCommit(repo, a, "alpha.txt", "a\n");
+    builderCommit(repo, b, "beta.txt", "b\n");
+    await run(repo, "enqueue", { id: a });
+    await run(repo, "enqueue", { id: b });
+    const mainBefore = git(repo, "rev-parse", "main");
+
+    assert.equal((await run(repo, "merge")).merged_into, "Branch_A");
+    assert.equal((await run(repo, "merge")).ok, true);
+    assert.equal(git(repo, "rev-parse", "main"), mainBefore);
+    const files = git(repo, "ls-tree", "--name-only", "Branch_A").split("\n");
+    assert.ok(["a.txt", "alpha.txt", "beta.txt"].every((f) => files.includes(f)));
+    assert.equal(git(repo, "rev-list", "--merges", "--count", "Branch_A"), "0");
+  });
+
+  test("merge mode refuses a protected base", async () => {
+    await run(repo, "profile", { base_branch: "Branch_A", protected_branches: ["Branch_A"] });
+    const id = await newId(repo, "x");
+    await run(repo, "start", { skip_install: true });
+    builderCommit(repo, id, "x.txt", "x\n");
+    await run(repo, "enqueue", { id });
+    const before = git(repo, "rev-parse", "Branch_A");
+    const result = await run(repo, "merge");
+    assert.equal(result.reason, "base-protected");
+    assert.equal(job(repo, id).stage, "needs-human");
+    assert.equal(git(repo, "rev-parse", "Branch_A"), before);
+  });
+
+  test("merge mode waits while the base is checked out elsewhere", async () => {
+    await run(repo, "profile", { base_branch: "Branch_A" });
+    const id = await newId(repo, "x");
+    await run(repo, "start", { skip_install: true });
+    await run(repo, "enqueue", { id });
+    git(repo, "worktree", "add", "-q", join(repo, "..", "elsewhere"), "Branch_A");
+    assert.equal((await run(repo, "merge")).reason, "base-checked-out");
+    assert.equal(job(repo, id).stage, "merge-queue");
+  });
+
+  test("branch mode rebases and tests, leaves the base alone, stops at ready", async () => {
+    await run(repo, "profile", { base_branch: "Branch_A", integration: "branch" });
+    const id = await newId(repo, "alpha");
+    await run(repo, "start", { skip_install: true });
+    builderCommit(repo, id, "alpha.txt", "a\n");
+    git(repo, "checkout", "-q", "Branch_A");
+    writeFileSync(join(repo, "later.txt"), "moved on\n");
+    git(repo, "add", "later.txt");
+    git(repo, "commit", "-qm", "base moved");
+    git(repo, "checkout", "-q", "main");
+    await run(repo, "enqueue", { id });
+    const before = git(repo, "rev-parse", "Branch_A");
+
+    const result = await run(repo, "merge");
+    assert.equal(result.ok, true, JSON.stringify(result));
+    assert.equal(result.branch, "feature/Branch_A/alpha");
+    assert.equal(job(repo, id).stage, "ready");
+    assert.equal(git(repo, "rev-parse", "Branch_A"), before);
+    assert.equal(git(repo, "merge-base", "Branch_A", job(repo, id).branch), before);
+    assert.ok(existsSync(join(repo, job(repo, id).worktree)));
+    assert.deepEqual((await run(repo, "cleanup")).merged_detected, []);
+  });
+
+  test("cleanup detects a ready branch a human merged", async () => {
+    await run(repo, "profile", { base_branch: "Branch_A", integration: "branch" });
+    const id = await newId(repo, "alpha");
+    await run(repo, "start", { skip_install: true });
+    builderCommit(repo, id, "alpha.txt", "a\n");
+    await run(repo, "enqueue", { id });
+    await run(repo, "merge");
+    git(repo, "checkout", "-q", "Branch_A");
+    git(repo, "merge", "-q", "--no-ff", "-m", "human merge", job(repo, id).branch);
+    git(repo, "checkout", "-q", "main");
+
+    const result = await run(repo, "cleanup");
+    assert.deepEqual(result.merged_detected, [id]);
+    assert.deepEqual(result.removed, [id]);
+    assert.equal(job(repo, id).stage, "merged");
+  });
+
+  test("branch mode pushes when configured", async () => {
+    const remote = join(repo, "..", "remote.git");
+    git(repo, "init", "-q", "--bare", remote);
+    git(repo, "remote", "add", "origin", remote);
+    await run(repo, "profile", { base_branch: "Branch_A", integration: "branch", push: true });
+    const id = await newId(repo, "alpha");
+    await run(repo, "start", { skip_install: true });
+    builderCommit(repo, id, "alpha.txt", "a\n");
+    await run(repo, "enqueue", { id });
+    assert.equal((await run(repo, "merge")).pushed, true);
+    assert.equal(git(remote, "rev-parse", job(repo, id).branch), git(repo, "rev-parse", job(repo, id).branch));
+  });
+
+  test("branch mode archives OpenSpec on the job branch", { skip: !hasOpenspec() && "openspec not installed" }, async () => {
+    git(repo, "checkout", "-q", "Branch_A");
+    execFileSync("openspec", ["init", "--tools", "none"], { cwd: repo, stdio: "ignore" });
+    git(repo, "add", "-A");
+    git(repo, "commit", "-qm", "openspec");
+    git(repo, "checkout", "-q", "main");
+    await run(repo, "profile", { base_branch: "Branch_A", integration: "branch" });
+    const id = await newId(repo, "greeting");
+    await run(repo, "start", { skip_install: true });
+    const wt = join(repo, job(repo, id).worktree);
+    execFileSync("openspec", ["new", "change", id], { cwd: wt, stdio: "ignore" });
+    const change = join(wt, "openspec", "changes", id);
+    writeFileSync(join(change, "proposal.md"), "## Why\nGreet.\n\n## What Changes\n- greet\n");
+    mkdirSync(join(change, "specs", "greeting"), { recursive: true });
+    writeFileSync(
+      join(change, "specs", "greeting", "spec.md"),
+      "## ADDED Requirements\n\n### Requirement: Greet\nThe system SHALL greet.\n\n" +
+        "#### Scenario: hello\n- **WHEN** asked\n- **THEN** it says hello\n",
+    );
+    writeFileSync(join(change, "tasks.md"), "- [x] 1.1 greet\n");
+    git(wt, "add", "-A");
+    git(wt, "commit", "-qm", "spec + impl");
+    await run(repo, "enqueue", { id });
+
+    const result = await run(repo, "merge");
+    assert.equal(result.ok, true, JSON.stringify(result));
+    assert.ok(existsSync(join(wt, "openspec", "specs", "greeting", "spec.md")));
+    assert.equal(git(wt, "status", "--porcelain"), "");
+    assert.equal(git(repo, "ls-tree", "--name-only", "main", "openspec"), "");
+    assert.ok(git(repo, "ls-tree", "-r", "--name-only", job(repo, id).branch).includes("openspec/specs/greeting/spec.md"));
   });
 });

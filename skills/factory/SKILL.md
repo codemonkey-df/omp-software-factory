@@ -1,6 +1,6 @@
 ---
 name: factory
-description: Software factory orchestrator. Use when the user runs /factory (init, <feature>, next, parallel, approve, rework, status, dashboard, cleanup) to run features through OpenSpec spec -> builder -> 4 reviewers -> approver -> serial merge queue, in parallel git worktrees, with a live dashboard.
+description: Software factory orchestrator. Use when the user runs /factory (init, config, <feature>, feature:/bugfix:/change:/hotfix:, next, parallel, approve, rework, done, status, dashboard, cleanup) to run jobs through OpenSpec spec -> builder -> 4 reviewers -> approver -> serial integration queue (stack onto a base branch, or hand off a branch for human review), in parallel git worktrees, with a live dashboard.
 ---
 
 # /factory — orchestrator
@@ -17,30 +17,60 @@ Paths used below (always pass ABSOLUTE paths to agents):
 - `WT` = `ROOT/.factory-worktrees/<id>` — the job's code
 - `CHANGE` = `WT/openspec/changes/<id>` — the job's OpenSpec change (on the job branch)
 - `JOB` = `ROOT/factory/jobs/<id>` — the job's records (build.md, round-N/, decision.md)
-- `PORT`, `BRANCH`, `BASE` (= `repo.main_branch`): from `factory(status)`
+- `PORT`, `BRANCH` (the job's branch), `BASE` (the job's `base_branch`): per job, from `factory(status)`
+
+## Integration config
+
+Every job branches from a base branch and is integrated back into it. `factory(status)`
+shows the config under `repo`:
+- `base_branch`: the parent branch jobs start from (e.g. `main`, `dev` or `Branch_A`).
+  A job can override it: `factory(new, title, base: "Branch_B")`.
+- `integration`:
+  - `merge`: approved jobs are stacked onto the base one at a time (rebase onto base,
+    tests, fast-forward). The base only ever moves forward; no merge commits.
+  - `branch`: for repos where nothing may be merged automatically. The job branch is
+    rebased onto the base, tested, gets the archived spec, is pushed if `push` is true,
+    and stops in `ready`. A human reviews and merges it (PR or locally).
+- `branch_pattern`: default `{type}/{base}/{slug}` → `feature/Branch_A/login-form`,
+  `bugfix/Branch_A/crash-save`, `change/...`, `hotfix/...`. Placeholders: `{type}`
+  `{base}` `{slug}` `{id}` `{number}`. Git cannot nest a branch under an existing branch
+  name, so `{base}/{slug}` fails when `{base}` exists; `factory(new)` explains such clashes.
+- `protected_branches`: never merged automatically, even in `merge` mode; jobs targeting
+  them go to needs-human with `reason: base-protected`.
+- `push`, `remote` (default `origin`): branch mode only.
 
 ## Commands
 
 | Input | Do |
 |---|---|
 | `/factory init` | [Init](#init) |
-| `/factory <feature>` | `factory(new, title: "<feature>")`, then run the [Scheduler](#scheduler) |
-| `/factory <f1> \| <f2> \| ...` | `factory(new)` for each, then run the scheduler |
-| `/factory next [n]` | First n (default 1) `- [ ]` lines of `factory/backlog.md`: `factory(new)` each, rewrite the line to `- [x] <text> (<id>)`, then run the scheduler |
+| `/factory config [key=value ...]` | No args: show `repo` from `factory(status)`. Otherwise `factory(profile, ...)` with those keys (`base_branch`, `integration`, `branch_pattern`, `push`, `remote`, `protected_branches` as a list) |
+| `/factory <request>` | `factory(new, title: "<request>", type)`, then run the [Scheduler](#scheduler). Infer `type` from the request: `bugfix` for fixing broken behaviour, `hotfix` only if the user says urgent/hotfix/production, `change` for modifying existing behaviour or refactors, else `feature`. Tell the user the type and branch you chose |
+| `/factory feature: <text>` (also `bugfix:`, `change:`, `hotfix:`) | Same, with that type, no inference |
+| `/factory ... @<branch>` | A trailing `@<branch>` sets `base: "<branch>"` for that job |
+| `/factory <r1> \| <r2> \| ...` | `factory(new)` for each, then run the scheduler |
+| `/factory next [n]` | First n (default 1) `- [ ]` lines of `factory/backlog.md`: `factory(new)` each (lines may start with a `type:` prefix), rewrite the line to `- [x] <text> (<id>)`, then run the scheduler |
 | `/factory parallel <n>` | `factory(parallel, n: <n>)` |
-| `/factory approve <id>` | `factory(enqueue, id)` (needs-human → merge queue), then run the scheduler |
+| `/factory approve <id>` | `factory(enqueue, id)` (needs-human → integration queue), then run the scheduler |
 | `/factory rework <id> <note>` | [Rework](#rework), then run the scheduler |
-| `/factory status` | `factory(status)`, summarise as a short table |
+| `/factory done <id>` | A human merged a `ready` branch (e.g. squash-merged a PR): `factory(set, id, stage: "merged")`, then `factory(cleanup)` |
+| `/factory status` | `factory(status)`, summarise as a short table (id, type, stage, branch → base) |
 | `/factory dashboard` | Start `python3 -m http.server 8765` in ROOT as a named background bash service (or `npx serve -l 8765` without Python); give the user `http://localhost:8765/factory/dashboard.html` |
-| `/factory cleanup` | `factory(cleanup)` |
+| `/factory cleanup` | `factory(cleanup)`: also marks `ready` jobs whose branch is already in its base as merged |
 
 If `factory/board.json` is missing, run [Init](#init) first.
 
 ## Init
 
-1. `factory(init)` creates `factory/` (board.json, backlog.md, dashboard.html, jobs/),
-   adds `.factory-worktrees/` to `.gitignore`, adds the factory rules to `AGENTS.md`, and
-   runs `openspec init --tools oh-my-pi` if `openspec/` is missing.
+1. Ask the user (one question each, offer the current branch as the default):
+   which base branch jobs start from and land on, and whether the factory may merge into
+   it (`merge`) or must leave branches for human review (`branch`). Then
+   `factory(init, base_branch, integration)`. It creates `factory/` (board.json,
+   backlog.md, dashboard.html, jobs/), adds `.factory-worktrees/` to `.gitignore`, adds
+   the factory rules to `AGENTS.md`, and runs `openspec init --tools oh-my-pi` if
+   `openspec/` is missing. If the user names branches that must never be merged
+   automatically (`main`, `dev`, release branches), record them:
+   `factory(profile, protected_branches: [...])`. In branch mode ask whether to push.
 2. Inspect the repo: manifests (package.json, pyproject.toml, go.mod, Cargo.toml, …),
    lockfiles, CI config, README, existing tests. Decide the language/framework,
    install command, test command, dev-server command (must honour `$PORT`), lint/format
@@ -49,16 +79,18 @@ If `factory/board.json` is missing, run [Init](#init) first.
 3. Write `factory/profile.md` with those facts (short, one section each), then
    `factory(profile, language, install, test, dev[, base_port])`.
    Also put a 3–5 line project summary into `openspec/config.yaml` under `context: |`.
-4. Commit the bootstrap on the main branch: `git add -A && git commit -m "factory: init"`.
-   (Worktrees branch from main HEAD, so openspec/ and the profile must be committed.)
+4. Commit the bootstrap: `git add -A && git commit -m "factory: init"`. Worktrees branch
+   from the base branch, so `openspec/` must be committed on the base branch: if the main
+   checkout is on another branch, ask the user before committing `openspec/` onto the base
+   (in `branch` mode the base may be protected; then they add it via their normal review).
 
 ## Scheduler
 
 Run this until no job is in spec/build/review/approve and the merge queue is empty
-(jobs in needs-human just wait):
+(jobs in needs-human or ready just wait):
 
-1. `factory(start)` fills free slots (max_parallel) with queued jobs: worktree + branch
-   `factory/<id>` from main HEAD, install command, port. For each started job do
+1. `factory(start)` fills free slots (max_parallel) with queued jobs: worktree + the job's
+   branch from its base branch HEAD, install command, port. For each started job do
    [Spec](#1-spec) right away, then [Build](#2-build). Report install warnings.
 2. Call `wait`. Each result or message belongs to one job (the agent name ends in the job
    id). Advance that job by the step below that matches the agent that finished.
@@ -92,7 +124,7 @@ Spawn ONE builder per job, with the name `builder-<id>` so it can be resumed lat
 `task` item `{ name: "builder-<id>", agent: "builder", task: <paths block + "Implement the change.">, solutionSpace: "spec given; implementation open" }`.
 Paths block (give every agent this, filled in):
 ```
-JOB_ID=<id>  BRANCH=factory/<id>  BASE=<main branch>  PORT=<port>
+JOB_ID=<id>  BRANCH=<job branch>  BASE=<job base_branch>  PORT=<port>
 WORKTREE=<abs WT>  CHANGE_DIR=<abs CHANGE>  JOB_DIR=<abs JOB>  PROFILE=<abs ROOT>/factory/profile.md
 ```
 When the builder finishes: check `JOB/build.md` exists, then
@@ -122,14 +154,27 @@ When it finishes: `factory(decide, id)`. APPROVE puts it in the merge queue; ESC
 it in needs-human (tell the user the approver's question; they answer with
 `/factory approve <id>` or `/factory rework <id> <note>`).
 
-### 5. Merge
-Only the orchestrator merges, one job at a time: `factory(merge)`. It takes the head of
-the queue, rebases `factory/<id>` onto main in WT, reruns the test command, fast-forwards
-main, runs `openspec archive <id> -y` in the main checkout, commits the archive plus the
-job records, and removes the worktree (the branch is kept).
-- `ok: true` → tell the user it merged; continue the scheduler.
-- `reason: main-not-clean` → the main checkout has changes outside `factory/`; ask the
-  user to commit/stash them, then retry.
+### 5. Merge (integration queue)
+Only the orchestrator integrates, one job at a time: `factory(merge)`. It takes the head
+of the queue, rebases BRANCH onto BASE in WT, reruns the test command, runs
+`openspec archive <id> -y` in WT and commits it on BRANCH. Then, by `repo.integration`:
+- `merge`: fast-forwards BASE to BRANCH (the main checkout does not need to be on BASE)
+  and removes the worktree (the branch is kept). Stage `merged`.
+- `branch`: BASE is not touched. Pushes BRANCH if `push` is on. Stage `ready`; the
+  worktree stays so rework is still possible.
+
+Results:
+- `ok: true, integration: merge` → tell the user it landed on BASE; continue.
+- `ok: true, integration: branch` → tell the user BRANCH is rebased on BASE, tested and
+  ready for their review (mention `pushed`/`push_error`). They merge it themselves, then
+  `/factory done <id>` or `/factory cleanup`. Rework on a ready job: `/factory rework`.
+- `reason: base-protected` → BASE is in `protected_branches`; the job is in needs-human.
+  Tell the user: switch to `integration=branch` (`/factory config`) and `/factory approve <id>`,
+  or merge BRANCH by hand.
+- `reason: main-not-clean` → the main checkout is on BASE and has changes outside
+  `factory/`; ask the user to commit/stash them, then retry.
+- `reason: base-checked-out` → BASE is checked out in another worktree; ask the user to
+  switch it, then retry.
 - `next: build` (rebase conflict or failing tests, first time) → `write agent://builder-<id>`
   with the `detail`: "Merge failed: <reason>. Rebase WORKTREE onto <BASE>, resolve,
   rerun tests, commit, append `## Merge fix` to build.md." When it finishes:
@@ -139,7 +184,7 @@ job records, and removes the worktree (the branch is kept).
 ### Rework
 `/factory rework <id> <note>`: write the note to `JOB/rework.md` and
 `factory(set, id, stage: "build", files: ["factory/jobs/<id>/rework.md"])`. If needed,
-recreate the worktree first: `git worktree add .factory-worktrees/<id> factory/<id>`.
+recreate the worktree first: `git worktree add .factory-worktrees/<id> <BRANCH>`.
 Then `write agent://builder-<id>`: "Rework requested: read <abs JOB>/rework.md, implement
 it, commit, append `## Rework` to build.md". When it finishes, run Review with the next n;
 CHANGES in that round go to needs-human.
@@ -157,4 +202,6 @@ CHANGES in that round go to needs-human.
 - Only the builder edits code, only in its job's worktree. Reviewers/approver are read-only.
 - Never edit the main checkout's code from a job. Never two jobs in one worktree.
 - Never run two merges at once. Never archive OpenSpec changes in parallel or outside merge.
+- Never merge, push or reset a base branch yourself (`git merge`, `git push`, `git reset`
+  on BASE): only `factory(merge)` integrates, and only as `repo.integration` allows.
 - Keep the user informed with one short line per state change (job, stage, verdicts).

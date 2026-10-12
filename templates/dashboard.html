@@ -23,7 +23,13 @@
   .lane.human b { color:var(--human); }
   .pill { padding:2px 8px; border-radius:999px; border:1px solid var(--line); font-size:12px; cursor:pointer; }
   .pill.next { border-color:var(--accent); color:var(--accent); font-weight:600; }
-  .board { display:grid; grid-template-columns:repeat(8, minmax(170px, 1fr)); gap:10px; padding:8px 20px 24px; overflow-x:auto; }
+  .lane.ready { border-color:var(--pass); }
+  .lane.ready b { color:var(--pass); }
+  .type { display:inline-block; padding:0 6px; margin-right:4px; border-radius:4px; font-size:10px; font-weight:600;
+          text-transform:uppercase; background:var(--line); color:var(--ink); vertical-align:1px; }
+  .type.bugfix { background:#fde68a; color:#78350f; } .type.hotfix { background:#fecaca; color:#7f1d1d; }
+  .type.change { background:#c7d2fe; color:#312e81; }
+  .board { display:grid; grid-template-columns:repeat(9, minmax(160px, 1fr)); gap:10px; padding:8px 20px 24px; overflow-x:auto; }
   .col h2 { font-size:12px; text-transform:uppercase; letter-spacing:.04em; color:var(--muted); margin:6px 2px 8px; }
   .col h2 span { float:right; }
   .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:10px; margin-bottom:8px; cursor:pointer; }
@@ -53,6 +59,7 @@
 <body>
 <header><h1>Software factory</h1><div class="meta" id="meta">loading…</div></header>
 <div class="lane human" id="human" hidden></div>
+<div class="lane ready" id="ready" hidden></div>
 <div class="lane" id="queue"></div>
 <div class="err" id="err" hidden></div>
 <div class="board" id="board"></div>
@@ -63,7 +70,7 @@
   <div class="doc" id="d-doc"></div>
 </aside>
 <script>
-const STAGES = ["queued","spec","build","review","approve","merge-queue","merged","needs-human"];
+const STAGES = ["queued","spec","build","review","approve","merge-queue","ready","merged","needs-human"];
 const REVIEWERS = ["security","ux","ui","code"];
 const ROOT = "../";                     // dashboard lives in factory/, files are repo-root relative
 const verdictCache = new Map();          // finished-round verdicts never change
@@ -102,22 +109,28 @@ async function roundsHtml(job) {
   return html ? `<div class="rounds">${html}</div>` : "";
 }
 
+const defaultBase = () => board.repo?.base_branch ?? board.repo?.main_branch ?? "main";
+const baseOf = job => job.base_branch ?? defaultBase();
+
 async function cardHtml(job) {
   const human = job.stage === "needs-human";
   return `<div class="card ${human ? "human" : ""}" onclick="openDrawer('${job.id}')">
-    <div class="id">${esc(job.id)}</div>
-    <div class="sub">${esc(job.branch)} · :${job.port}</div>
+    <div class="id"><span class="type ${esc(job.type || "feature")}">${esc(job.type || "feature")}</span>${esc(job.id)}</div>
+    <div class="sub">${esc(job.branch)} → ${esc(baseOf(job))} · :${job.port}</div>
     ${job.note ? `<div class="note">${esc(job.note)}</div>` : ""}
     ${await roundsHtml(job)}</div>`;
 }
 
 async function render() {
   const jobs = board.jobs;
+  const integration = board.repo?.integration ?? "merge";
+  const mode = integration === "branch" ? "branch hand-off (human merges)" : "stack onto base";
   document.getElementById("meta").textContent =
-    `${jobs.length} jobs · max_parallel ${board.max_parallel} · base ${board.repo?.main_branch ?? "main"} · updated ${new Date().toLocaleTimeString()}`;
+    `${jobs.length} jobs · max_parallel ${board.max_parallel} · base ${defaultBase()} · ${mode} · updated ${new Date().toLocaleTimeString()}`;
 
   const q = board.merge_queue;
-  document.getElementById("queue").innerHTML = `<b>Merge queue</b>` + (q.length
+  const queueLabel = integration === "branch" ? "Hand-off queue" : "Merge queue";
+  document.getElementById("queue").innerHTML = `<b>${queueLabel}</b>` + (q.length
     ? q.map((id, i) => `<span class="pill ${i === 0 ? "next" : ""}" onclick="openDrawer('${id}')">${i === 0 ? "next → " : ""}${esc(id)}</span>`).join("")
     : `<span class="sub">empty</span>`);
 
@@ -126,6 +139,12 @@ async function render() {
   humanEl.hidden = !human.length;
   humanEl.innerHTML = `<b>Needs human</b>` + human.map(j =>
     `<span class="pill" onclick="openDrawer('${j.id}')">${esc(j.id)} — ${esc(j.note || "escalated")}</span>`).join("");
+
+  const ready = jobs.filter(j => j.stage === "ready");
+  const readyEl = document.getElementById("ready");
+  readyEl.hidden = !ready.length;
+  readyEl.innerHTML = `<b>Ready for your review</b>` + ready.map(j =>
+    `<span class="pill" onclick="openDrawer('${j.id}')">${esc(j.branch)} → ${esc(baseOf(j))}${j.pushed ? " · pushed" : ""}${j.note ? " · " + esc(j.note) : ""}</span>`).join("");
 
   const cols = [];
   for (const stage of STAGES) {
@@ -150,7 +169,7 @@ function renderDrawer() {
   const job = board.jobs.find(j => j.id === openJob);
   if (!job) return closeDrawer();
   document.getElementById("d-title").textContent = `${job.id} — ${job.title}`;
-  document.getElementById("d-sub").textContent = `${job.stage} · round ${job.round} · ${job.branch} · ${job.worktree} · :${job.port}`;
+  document.getElementById("d-sub").textContent = `${job.type || "feature"} · ${job.stage} · round ${job.round} · ${job.branch} → ${baseOf(job)} · ${job.worktree} · :${job.port}`;
   if (!openFile && job.files.length) openFile = job.files[0];
   document.getElementById("d-files").innerHTML = job.files.map(f =>
     `<span class="pill ${f === openFile ? "on" : ""}" title="${esc(f)}" onclick="showFile('${esc(f)}')">${esc(fileLabel(f))}</span>`

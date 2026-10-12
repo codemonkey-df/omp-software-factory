@@ -2,8 +2,8 @@
  * Deterministic state and git plumbing for the /factory skill.
  *
  * The orchestrator calls this (through the `factory` tool) for everything that must be
- * exact: board.json edits, job ids, worktrees, ports, round bookkeeping and the serial
- * merge queue. Judgement (specs, code, reviews) stays with the agents.
+ * exact: board.json edits, job ids, branch names, worktrees, ports, round bookkeeping and
+ * the serial integration queue. Judgement (specs, code, reviews) stays with the agents.
  *
  * Runs inside OMP's process, so every external command is async: a blocking call would
  * freeze the session and its in-process subagents for the duration of a test run.
@@ -36,9 +36,15 @@ export const STAGES = [
   "review",
   "approve",
   "merge-queue",
+  "ready",
   "merged",
   "needs-human",
 ] as const;
+export const JOB_TYPES = ["feature", "bugfix", "change", "hotfix"] as const;
+/** merge: stack approved jobs onto their base branch. branch: hand off a tested branch for a human to merge. */
+export const INTEGRATIONS = ["merge", "branch"] as const;
+export const DEFAULT_BRANCH_PATTERN = "{type}/{base}/{slug}";
+
 const ACTIVE_STAGES = new Set<Stage>(["spec", "build", "review", "approve"]);
 const WORKTREES_DIR = ".factory-worktrees";
 const AGENTS_BEGIN = "<!-- factory:begin -->";
@@ -53,21 +59,32 @@ const SLUG_STOPWORDS = new Set(
 
 export type Reviewer = (typeof REVIEWERS)[number];
 export type Stage = (typeof STAGES)[number];
+export type JobType = (typeof JOB_TYPES)[number];
+export type Integration = (typeof INTEGRATIONS)[number];
 export type Verdict = "PASS" | "CHANGES" | "INVALID" | "pending";
 
 export interface RepoProfile {
-  main_branch: string;
+  base_branch: string;
+  integration: Integration;
+  branch_pattern: string;
+  push: boolean;
+  remote: string;
+  protected_branches: string[];
   base_port: number;
   install: string;
   test: string;
   dev: string;
   language?: string;
+  /** Boards written before base_branch existed. */
+  main_branch?: string;
 }
 
 export interface Job {
   id: string;
   title: string;
+  type: JobType;
   number: number;
+  base_branch: string;
   branch: string;
   worktree: string;
   port: number;
@@ -79,8 +96,10 @@ export interface Job {
   note: string;
   created: string;
   updated: string;
-  base?: string;
+  base_sha?: string;
   merged_at?: string;
+  ready_at?: string;
+  pushed?: boolean;
 }
 
 export interface Board {
@@ -135,10 +154,19 @@ async function git(cwd: string, ...args: string[]): Promise<string> {
   return result.stdout.trim();
 }
 
+async function branchExists(cwd: string, name: string): Promise<boolean> {
+  return (await sh(["git", "show-ref", "--verify", "--quiet", `refs/heads/${name}`], cwd)).code === 0;
+}
+
 /** Turn a feature request into a short kebab-case slug (at most 5 meaningful words). */
 export function slugify(title: string): string {
   const words = (title.toLowerCase().match(/[a-z0-9]+/g) ?? []).filter((w) => !SLUG_STOPWORDS.has(w));
   return words.slice(0, SLUG_WORDS).join("-").slice(0, 40).replace(/-+$/, "") || "job";
+}
+
+/** Fill a branch pattern such as `{type}/{base}/{slug}`. */
+export function renderBranch(pattern: string, fields: Record<"type" | "base" | "slug" | "id" | "number", string>) {
+  return pattern.replace(/\{(type|base|slug|id|number)\}/g, (_, key: keyof typeof fields) => fields[key]);
 }
 
 /** First-line verdict of a review/decision file: null if missing, INVALID if unrecognised. */
@@ -151,6 +179,13 @@ export function readVerdict<T extends string>(path: string, allowed: readonly T[
   return (words.find((w) => (allowed as readonly string[]).includes(w)) as T | undefined) ?? "INVALID";
 }
 
+function oneOf<T extends string>(value: string, allowed: readonly T[], what: string): T {
+  if (!(allowed as readonly string[]).includes(value)) {
+    throw new FactoryError(`unknown ${what} "${value}"; expected one of ${allowed.join(", ")}`);
+  }
+  return value as T;
+}
+
 /** All factory operations against one main checkout. */
 export class Factory {
   readonly root: string;
@@ -159,7 +194,7 @@ export class Factory {
   readonly jobsDir: string;
 
   constructor(root: string) {
-    this.root = root;
+    this.root = existsSync(root) ? realpathSync(root) : root;
     this.state = join(root, "factory");
     this.boardPath = join(this.state, "board.json");
     this.jobsDir = join(this.state, "jobs");
@@ -180,7 +215,20 @@ export class Factory {
 
   load(): Board {
     if (!existsSync(this.boardPath)) throw new FactoryError("factory not initialised: run `/factory init`");
-    return JSON.parse(readFileSync(this.boardPath, "utf8")) as Board;
+    const board = JSON.parse(readFileSync(this.boardPath, "utf8")) as Board;
+    const repo = board.repo;
+    repo.base_branch ??= repo.main_branch ?? "main";
+    delete repo.main_branch;
+    repo.integration ??= "merge";
+    repo.branch_pattern ??= DEFAULT_BRANCH_PATTERN;
+    repo.push ??= false;
+    repo.remote ??= "origin";
+    repo.protected_branches ??= [];
+    for (const job of board.jobs) {
+      job.type ??= "feature";
+      job.base_branch ??= repo.base_branch;
+    }
+    return board;
   }
 
   save(board: Board): void {
@@ -207,16 +255,30 @@ export class Factory {
   // ----- setup -----------------------------------------------------------------------
 
   /** Create factory state, gitignore entries, AGENTS.md section and OpenSpec. */
-  async init(opts: { maxParallel?: number; basePort?: number; openspec?: boolean } = {}) {
+  async init(
+    opts: { maxParallel?: number; basePort?: number; baseBranch?: string; integration?: string; openspec?: boolean } = {},
+  ) {
     const { maxParallel = 3, basePort = 3000, openspec = true } = opts;
     mkdirSync(this.jobsDir, { recursive: true });
     writeFileSync(join(this.jobsDir, ".gitkeep"), "");
     const created: string[] = [];
     if (!existsSync(this.boardPath)) {
-      const branch = await git(this.root, "rev-parse", "--abbrev-ref", "HEAD");
+      const base = opts.baseBranch ?? (await git(this.root, "rev-parse", "--abbrev-ref", "HEAD"));
+      if (!(await branchExists(this.root, base))) throw new FactoryError(`base branch "${base}" does not exist`);
       this.save({
         max_parallel: maxParallel,
-        repo: { main_branch: branch, base_port: basePort, install: "", test: "", dev: "" },
+        repo: {
+          base_branch: base,
+          integration: oneOf(opts.integration ?? "merge", INTEGRATIONS, "integration"),
+          branch_pattern: DEFAULT_BRANCH_PATTERN,
+          push: false,
+          remote: "origin",
+          protected_branches: [],
+          base_port: basePort,
+          install: "",
+          test: "",
+          dev: "",
+        },
         merge_queue: [],
         jobs: [],
       });
@@ -264,9 +326,16 @@ export class Factory {
     writeFileSync(path, `${text.trimEnd()}\n`);
   }
 
-  /** Record the repo's install/test/dev commands, language, main branch or base port. */
-  profile(updates: Partial<RepoProfile>): RepoProfile {
+  /** Record repo commands and integration settings (base branch, mode, branch pattern, push). */
+  async profile(updates: Partial<RepoProfile>): Promise<RepoProfile> {
     const board = this.load();
+    if (updates.integration !== undefined) oneOf(updates.integration, INTEGRATIONS, "integration");
+    if (updates.base_branch !== undefined && !(await branchExists(this.root, updates.base_branch))) {
+      throw new FactoryError(`base branch "${updates.base_branch}" does not exist locally`);
+    }
+    if (updates.branch_pattern !== undefined && !updates.branch_pattern.includes("{slug}")) {
+      if (!updates.branch_pattern.includes("{id}")) throw new FactoryError("branch_pattern needs {slug} or {id}");
+    }
     for (const [key, value] of Object.entries(updates)) {
       if (value !== undefined) (board.repo as unknown as Record<string, unknown>)[key] = value;
     }
@@ -282,19 +351,62 @@ export class Factory {
     return { max_parallel: n };
   }
 
+  // ----- branches --------------------------------------------------------------------
+
+  /**
+   * Pick the job's branch name from the pattern and check git can create it. Git stores
+   * branches as paths, so `a/b` cannot coexist with a branch `a` or with branches `a/b/...`.
+   */
+  private async allocateBranch(board: Board, fields: Parameters<typeof renderBranch>[1]): Promise<string> {
+    const taken = new Set(board.jobs.map((j) => j.branch));
+    let name = renderBranch(board.repo.branch_pattern, fields);
+    if (taken.has(name) || (await branchExists(this.root, name))) name = `${name}-${fields.number}`;
+    if (taken.has(name) || (await branchExists(this.root, name))) {
+      throw new FactoryError(`branch ${name} already exists`);
+    }
+    const format = await sh(["git", "check-ref-format", "--branch", name], this.root);
+    if (format.code !== 0) throw new FactoryError(`"${name}" is not a valid git branch name`);
+
+    const parts = name.split("/");
+    for (let i = 1; i < parts.length; i++) {
+      const prefix = parts.slice(0, i).join("/");
+      if (taken.has(prefix) || (await branchExists(this.root, prefix))) {
+        throw new FactoryError(
+          `cannot create branch "${name}": branch "${prefix}" exists, and git cannot have a branch and ` +
+            `a folder of branches with the same name. Change branch_pattern (default ${DEFAULT_BRANCH_PATTERN}).`,
+        );
+      }
+    }
+    const children = await git(this.root, "for-each-ref", "--count=1", "--format=%(refname:short)", `refs/heads/${name}/`);
+    if (children || [...taken].some((b) => b.startsWith(`${name}/`))) {
+      throw new FactoryError(`cannot create branch "${name}": branches under "${name}/" already exist`);
+    }
+    return name;
+  }
+
   // ----- job lifecycle ---------------------------------------------------------------
 
-  /** Register a queued job with the next id (job-NNN-slug). */
-  newJob(title: string): Job {
+  /** Register a queued job: id job-NNN-slug, branch from the pattern, base branch. */
+  async newJob(title: string, opts: { type?: string; base?: string } = {}): Promise<Job> {
     const board = this.load();
+    const type = oneOf(opts.type ?? "feature", JOB_TYPES, "job type");
+    const base = opts.base ?? board.repo.base_branch;
+    if (!(await branchExists(this.root, base))) {
+      throw new FactoryError(`base branch "${base}" does not exist locally (create it or fetch it first)`);
+    }
     const numbers = board.jobs.map((j) => Number(/^job-(\d+)-/.exec(j.id)?.[1] ?? 0));
     const number = Math.max(0, ...numbers) + 1;
-    const id = `job-${String(number).padStart(3, "0")}-${slugify(title)}`;
+    const padded = String(number).padStart(3, "0");
+    const slug = slugify(title);
+    const id = `job-${padded}-${slug}`;
+    const branch = await this.allocateBranch(board, { type, base, slug, id, number: padded });
     const job: Job = {
       id,
       title,
+      type,
       number,
-      branch: `factory/${id}`,
+      base_branch: base,
+      branch,
       worktree: `${WORKTREES_DIR}/${id}`,
       port: board.repo.base_port + number,
       stage: "queued",
@@ -311,25 +423,25 @@ export class Factory {
     return job;
   }
 
-  /** Start queued jobs while slots are free: worktree + branch from main HEAD, install. */
+  /** Start queued jobs while slots are free: worktree + branch from its base's HEAD, install. */
   async start(opts: { install?: boolean; signal?: AbortSignal } = {}) {
     const { install = true, signal } = opts;
     const board = this.load();
     let active = board.jobs.filter((j) => ACTIVE_STAGES.has(j.stage)).length;
-    const base = await git(this.root, "rev-parse", board.repo.main_branch);
     const started: Job[] = [];
     const warnings: { id: string; install: string }[] = [];
     for (const job of board.jobs) {
       if (active >= board.max_parallel) break;
       if (job.stage !== "queued") continue;
       const wt = join(this.root, job.worktree);
-      await git(this.root, "worktree", "add", "-q", wt, "-b", job.branch, base);
+      const baseSha = await git(this.root, "rev-parse", `refs/heads/${job.base_branch}`);
+      await git(this.root, "worktree", "add", "-q", wt, "-b", job.branch, baseSha);
       mkdirSync(join(this.jobsDir, job.id), { recursive: true });
       if (install && board.repo.install) {
         const result = await sh(board.repo.install, wt, { PORT: String(job.port) }, signal);
         if (result.code !== 0) warnings.push({ id: job.id, install: tail(result.stderr || result.stdout) });
       }
-      this.touch(job, { stage: "spec", base });
+      this.touch(job, { stage: "spec", base_sha: baseSha });
       started.push(job);
       active += 1;
       this.save(board);
@@ -344,10 +456,7 @@ export class Factory {
     const board = this.load();
     const job = this.job(board, id);
     if (opts.stage !== undefined) {
-      if (!(STAGES as readonly string[]).includes(opts.stage)) {
-        throw new FactoryError(`unknown stage ${opts.stage}; expected one of ${STAGES.join(", ")}`);
-      }
-      job.stage = opts.stage as Stage;
+      job.stage = oneOf(opts.stage, STAGES, "stage");
       if (opts.stage !== "merge-queue") board.merge_queue = board.merge_queue.filter((j) => j !== id);
     }
     if (opts.round !== undefined) job.round = opts.round;
@@ -417,7 +526,7 @@ export class Factory {
     return { id, decision, stage: job.stage };
   }
 
-  /** Put a job in the merge queue (/factory approve, and after a merge fix). */
+  /** Put a job in the integration queue (/factory approve, and after a merge fix). */
   enqueue(id: string) {
     const board = this.load();
     this.enqueueJob(board, this.job(board, id));
@@ -431,7 +540,7 @@ export class Factory {
     if (!board.merge_queue.includes(job.id)) board.merge_queue.push(job.id);
   }
 
-  // ----- merge queue -----------------------------------------------------------------
+  // ----- integration queue -----------------------------------------------------------
 
   private acquireMergeLock(): () => void {
     const lock = join(this.state, ".merge.lock");
@@ -446,7 +555,12 @@ export class Factory {
     return () => rmSync(lock, { force: true });
   }
 
-  /** Merge the next queued job: rebase, test, fast-forward, archive, remove worktree. */
+  /**
+   * Integrate the head of the queue (one at a time). Always: rebase onto the job's base
+   * branch and rerun the tests. Then, by repo.integration:
+   * - merge:  fast-forward the base, archive OpenSpec in the main checkout, remove the worktree.
+   * - branch: archive OpenSpec on the job branch, optionally push, stop at "ready" for a human.
+   */
   async merge(id?: string, signal?: AbortSignal) {
     const release = this.acquireMergeLock();
     try {
@@ -461,23 +575,49 @@ export class Factory {
     const next = id ?? board.merge_queue[0];
     if (!next) return { ok: true, merged: null, detail: "merge queue empty" };
     const job = this.job(board, next);
-    const { main_branch: main, test } = board.repo;
+    const { integration, test, protected_branches: protectedBranches } = board.repo;
+    const base = job.base_branch;
     const wt = join(this.root, job.worktree);
 
-    const current = await git(this.root, "rev-parse", "--abbrev-ref", "HEAD");
-    const porcelain = (await sh(["git", "status", "--porcelain"], this.root)).stdout;
-    const dirty = porcelain.split("\n").filter((line) => line && !line.slice(3).startsWith("factory/"));
-    if (current !== main || dirty.length) {
-      return {
-        ok: false,
-        id: job.id,
-        reason: "main-not-clean",
-        next: "retry",
-        detail: `main checkout must be on ${main} with no changes outside factory/: ${dirty.join(", ")}`,
-      };
+    if (integration === "merge") {
+      if (protectedBranches.includes(base)) {
+        this.touch(job, { stage: "needs-human", note: `${base} is protected: no automatic merge` });
+        board.merge_queue = board.merge_queue.filter((j) => j !== job.id);
+        this.save(board);
+        return {
+          ok: false,
+          id: job.id,
+          reason: "base-protected",
+          next: "needs-human",
+          detail: `${base} is in protected_branches; set integration=branch or merge ${job.branch} by hand`,
+        };
+      }
+      const holder = await this.checkedOutAt(base);
+      if (holder && holder !== this.root) {
+        return {
+          ok: false,
+          id: job.id,
+          reason: "base-checked-out",
+          next: "retry",
+          detail: `${base} is checked out in ${holder}; switch that worktree to another branch first`,
+        };
+      }
+      if (holder === this.root) {
+        const porcelain = (await sh(["git", "status", "--porcelain"], this.root)).stdout;
+        const dirty = porcelain.split("\n").filter((line) => line && !line.slice(3).startsWith("factory/"));
+        if (dirty.length) {
+          return {
+            ok: false,
+            id: job.id,
+            reason: "main-not-clean",
+            next: "retry",
+            detail: `main checkout is on ${base} with changes outside factory/: ${dirty.join(", ")}`,
+          };
+        }
+      }
     }
 
-    if ((await sh(["git", "rebase", main], wt)).code !== 0) {
+    if ((await sh(["git", "rebase", `refs/heads/${base}`], wt)).code !== 0) {
       const conflicts = (await sh(["git", "diff", "--name-only", "--diff-filter=U"], wt)).stdout.trim();
       await sh(["git", "rebase", "--abort"], wt);
       return this.mergeFailed(board, job, "rebase-conflict", `conflicting files:\n${conflicts}`);
@@ -488,31 +628,110 @@ export class Factory {
       if (tests.code !== 0) return this.mergeFailed(board, job, "tests-failed", tail(tests.stdout + tests.stderr));
     }
 
-    await git(this.root, "merge", "--ff-only", "-q", job.branch);
     board.merge_queue = board.merge_queue.filter((j) => j !== job.id);
+    return integration === "branch" ? this.handOff(board, job, wt) : this.mergeIntoBase(board, job, wt);
+  }
+
+  /** Path of the worktree that has `branch` checked out, if any. */
+  private async checkedOutAt(branch: string): Promise<string | null> {
+    const list = await git(this.root, "worktree", "list", "--porcelain");
+    let path: string | null = null;
+    for (const line of list.split("\n")) {
+      if (line.startsWith("worktree ")) path = line.slice("worktree ".length);
+      if (line === `branch refs/heads/${branch}` && path) return realpathSync(path);
+    }
+    return null;
+  }
+
+  /** Archive the OpenSpec change on the job branch and commit it there. */
+  private async archiveOnBranch(board: Board, job: Job, wt: string): Promise<string | null> {
+    const archived = await this.archive(job, wt);
+    if (archived) {
+      await git(wt, "add", "-A", "--", "openspec");
+      if ((await sh(["git", "diff", "--cached", "--quiet"], wt)).code !== 0) {
+        await git(wt, "commit", "-q", "-m", `${job.id}: archive OpenSpec change`);
+      }
+    }
+    this.save(board);
+    return archived;
+  }
+
+  private archiveFailed(board: Board, job: Job, err: unknown) {
+    this.touch(job, { stage: "needs-human", note: "tested, but OpenSpec archive failed" });
+    this.save(board);
+    return { ok: false, id: job.id, reason: "archive-failed", detail: String(err), next: "needs-human" };
+  }
+
+  /** Fast-forward the base branch to the job branch; the base is never rewritten. */
+  private async mergeIntoBase(board: Board, job: Job, wt: string) {
     let archived: string | null;
     try {
-      archived = await this.archive(job);
+      archived = await this.archiveOnBranch(board, job, wt);
     } catch (err) {
-      this.touch(job, { stage: "needs-human", note: "merged, but OpenSpec archive failed" });
-      this.save(board);
-      return { ok: false, id: job.id, reason: "archive-failed", detail: String(err), next: "needs-human" };
+      return this.archiveFailed(board, job, err);
     }
-    this.touch(job, { stage: "merged", note: "", merged_at: now() });
-    this.save(board);
+    const base = job.base_branch;
+    const oldSha = await git(this.root, "rev-parse", `refs/heads/${base}`);
+    const newSha = await git(wt, "rev-parse", "HEAD");
+    if ((await sh(["git", "merge-base", "--is-ancestor", oldSha, newSha], this.root)).code !== 0) {
+      return this.mergeFailed(board, job, "base-moved", `${base} moved during the merge; retry`);
+    }
+    const holder = await this.checkedOutAt(base);
+    if (holder === this.root) await git(this.root, "merge", "--ff-only", "-q", job.branch);
+    else await git(this.root, "update-ref", "-m", `factory: merge ${job.id}`, `refs/heads/${base}`, newSha, oldSha);
 
-    const paths = ["openspec", "factory"].filter((p) => existsSync(join(this.root, p)));
-    await git(this.root, "add", "-A", "--", ...paths);
-    if ((await sh(["git", "diff", "--cached", "--quiet"], this.root)).code !== 0) {
-      await git(this.root, "commit", "-q", "-m", `factory: archive ${job.id}`);
+    this.touch(job, { stage: "merged", note: "", merged_at: now() });
+    if (holder === this.root) this.repointToRoot(job);
+    this.save(board);
+    if (holder === this.root) {
+      await git(this.root, "add", "-A", "--", "factory");
+      if ((await sh(["git", "diff", "--cached", "--quiet"], this.root)).code !== 0) {
+        await git(this.root, "commit", "-q", "-m", `factory: record ${job.id}`);
+      }
     }
     const removed = await sh(["git", "worktree", "remove", wt], this.root);
     return {
       ok: true,
       id: job.id,
+      integration: "merge",
+      merged_into: base,
       archived,
       worktree_removed: removed.code === 0,
       detail: removed.stderr.trim(),
+      merge_queue: board.merge_queue,
+    };
+  }
+
+  private async handOff(board: Board, job: Job, wt: string) {
+    let archived: string | null;
+    try {
+      archived = await this.archiveOnBranch(board, job, wt);
+    } catch (err) {
+      return this.archiveFailed(board, job, err);
+    }
+    let pushError = "";
+    if (board.repo.push) {
+      const push = await sh(["git", "push", "-u", board.repo.remote, job.branch], wt);
+      if (push.code !== 0) pushError = tail(push.stderr.trim());
+    }
+    const pushed = board.repo.push && !pushError;
+    this.touch(job, {
+      stage: "ready",
+      ready_at: now(),
+      pushed,
+      note: pushError ? "ready, but push failed" : "",
+    });
+    this.save(board);
+    return {
+      ok: true,
+      id: job.id,
+      integration: "branch",
+      branch: job.branch,
+      base_branch: job.base_branch,
+      archived,
+      pushed,
+      push_error: pushError || undefined,
+      detail: `${job.branch} is rebased on ${job.base_branch}, tested and ready for human review`,
       merge_queue: board.merge_queue,
     };
   }
@@ -526,23 +745,32 @@ export class Factory {
     return { ok: false, id: job.id, reason, detail, next };
   }
 
-  /** Archive the job's OpenSpec change in the main checkout and repoint its files. */
-  private async archive(job: Job): Promise<string | null> {
-    if (!existsSync(join(this.root, "openspec", "changes", job.id))) return null;
-    const result = await sh(["openspec", "archive", job.id, "-y"], this.root);
+  /**
+   * Run `openspec archive` in the job's worktree and repoint the job's file list at the
+   * archived copy. Returns the archive dir relative to the repo root.
+   */
+  private async archive(job: Job, wt: string): Promise<string | null> {
+    if (!existsSync(join(wt, "openspec", "changes", job.id))) return null;
+    const result = await sh(["openspec", "archive", job.id, "-y"], wt);
     if (result.code !== 0) {
       throw new FactoryError(`openspec archive ${job.id} failed: ${tail(result.stdout + result.stderr)}`);
     }
-    const archiveRoot = join(this.root, "openspec", "changes", "archive");
+    const archiveRoot = join(wt, "openspec", "changes", "archive");
     const match = readdirSync(archiveRoot)
       .filter((name) => name.endsWith(`-${job.id}`))
       .sort()
       .at(-1);
     if (!match) return null;
-    const archived = relative(this.root, join(archiveRoot, match));
+    const archived = relative(wt, join(archiveRoot, match));
     const oldPrefix = `${job.worktree}/openspec/changes/${job.id}/`;
-    job.files = job.files.map((f) => f.replace(oldPrefix, `${archived}/`));
+    job.files = job.files.map((f) => f.replace(oldPrefix, `${job.worktree}/${archived}/`));
     return archived;
+  }
+
+  /** After the worktree is gone, point files at the base branch copy (in the main checkout if it is on base). */
+  private repointToRoot(job: Job): void {
+    const prefix = `${job.worktree}/`;
+    job.files = job.files.map((f) => (f.startsWith(prefix) ? f.slice(prefix.length) : f));
   }
 
   // ----- housekeeping ----------------------------------------------------------------
@@ -555,21 +783,37 @@ export class Factory {
       free_slots: Math.max(board.max_parallel - active, 0),
       repo: board.repo,
       merge_queue: board.merge_queue,
-      jobs: board.jobs.map(({ id, stage, round, port, branch, reviews, note }) => ({
+      jobs: board.jobs.map(({ id, type, stage, round, port, branch, base_branch, reviews, note }) => ({
         id,
+        type,
         stage,
         round,
         port,
         branch,
+        base_branch,
         reviews,
         note,
       })),
     };
   }
 
-  /** Remove worktrees of merged jobs and prune git's worktree list. */
+  /**
+   * Mark "ready" jobs whose branch a human has merged into its base, then remove the
+   * worktrees of merged jobs and prune git's worktree list. Squash merges are not
+   * detectable: mark those with set(stage: "merged") first.
+   */
   async cleanup() {
     const board = this.load();
+    const detected: string[] = [];
+    for (const job of board.jobs) {
+      if (job.stage !== "ready") continue;
+      const merged = await sh(["git", "merge-base", "--is-ancestor", job.branch, `refs/heads/${job.base_branch}`], this.root);
+      if (merged.code === 0) {
+        this.touch(job, { stage: "merged", merged_at: now() });
+        detected.push(job.id);
+      }
+    }
+    this.save(board);
     const removed: string[] = [];
     const failed: { id: string; error: string }[] = [];
     for (const job of board.jobs) {
@@ -580,6 +824,7 @@ export class Factory {
       else failed.push({ id: job.id, error: result.stderr.trim() });
     }
     await git(this.root, "worktree", "prune");
-    return { removed, failed };
+    const stillReady = board.jobs.filter((j) => j.stage === "ready").map((j) => j.branch);
+    return { merged_detected: detected, removed, failed, still_ready: stillReady };
   }
 }

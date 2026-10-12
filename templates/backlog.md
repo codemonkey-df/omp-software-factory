@@ -1,6 +1,7 @@
 # Factory backlog
 
-One feature per unchecked line. `/factory next [n]` starts the first n unchecked items
-and ticks them off. Write each item as a one-line feature request.
+One job per unchecked line. `/factory next [n]` starts the first n unchecked items
+and ticks them off. Write each item as a one-line request, optionally prefixed with its
+type (`feature:`, `bugfix:`, `change:`, `hotfix:`) and suffixed with `@<base-branch>`.
 
-- [ ] Example: add a /health endpoint that returns build version and uptime
+- [ ] feature: Example: add a /health endpoint that returns build version and uptime

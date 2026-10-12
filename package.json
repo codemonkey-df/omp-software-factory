@@ -1,6 +1,6 @@
 {
   "name": "omp-sw-factory",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "OMP plugin: a visual software factory (/factory) built on subagents, OpenSpec, git worktrees and markdown files.",
   "private": true,
   "license": "MIT",
