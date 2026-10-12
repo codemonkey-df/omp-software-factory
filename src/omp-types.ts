@@ -1,0 +1,48 @@
+/**
+ * The slice of OMP's extension API this package uses (see omp://extensions.md).
+ * Declared locally so the package has no runtime or build dependency on OMP itself.
+ */
+
+export interface Schema {
+  optional(): Schema;
+}
+
+export interface ZodLike {
+  object(shape: Record<string, Schema>): Schema;
+  string(): Schema;
+  number(): Schema;
+  boolean(): Schema;
+  array(item: Schema): Schema;
+  enum(values: readonly [string, ...string[]]): Schema;
+}
+
+export interface ToolResult {
+  content: { type: "text"; text: string }[];
+  details?: unknown;
+}
+
+export interface ToolContext {
+  cwd: string;
+  agent?: { kind: "main" | "sub"; name?: string };
+}
+
+export interface ToolDefinition<P> {
+  name: string;
+  label: string;
+  description: string;
+  parameters: Schema;
+  loadMode?: "discoverable" | "essential";
+  execute(
+    toolCallId: string,
+    params: P,
+    signal: AbortSignal | undefined,
+    onUpdate: ((update: ToolResult) => void) | undefined,
+    ctx: ToolContext,
+  ): Promise<ToolResult>;
+}
+
+export interface ExtensionAPI {
+  zod: ZodLike;
+  setLabel(label: string): void;
+  registerTool<P>(tool: ToolDefinition<P>): void;
+}

@@ -12,10 +12,13 @@ if [[ $# -eq 0 ]]; then
 fi
 
 repo="$(cd "$1" && git rev-parse --show-toplevel)"
-mkdir -p "$repo/.omp/skills" "$repo/.omp/agents" "$repo/.omp/commands"
-rm -rf "$repo/.omp/skills/factory"
-cp -R "$here/skills/factory" "$repo/.omp/skills/factory"
-find "$repo/.omp/skills/factory" -name __pycache__ -type d -prune -exec rm -rf {} +
-cp "$here"/agents/*.md "$repo/.omp/agents/"
-cp "$here/commands/factory.md" "$repo/.omp/commands/factory.md"
-echo "Installed into $repo/.omp. In that repo: omp, then /factory init"
+omp_dir="$repo/.omp"
+ext="$omp_dir/extensions/sw-factory"
+mkdir -p "$omp_dir/skills" "$omp_dir/agents" "$omp_dir/commands" "$ext"
+rm -rf "$omp_dir/skills/factory" "$ext/src" "$ext/templates"
+cp -R "$here/skills/factory" "$omp_dir/skills/factory"
+cp "$here"/agents/*.md "$omp_dir/agents/"
+cp "$here/commands/factory.md" "$omp_dir/commands/factory.md"
+cp -R "$here/src" "$here/templates" "$ext/"
+printf '{\n  "name": "omp-sw-factory",\n  "type": "module",\n  "omp": { "extensions": ["./src/index.ts"] }\n}\n' >"$ext/package.json"
+echo "Installed into $omp_dir. In that repo: omp, then /factory init"

@@ -3,7 +3,7 @@
 This repo runs a software factory. Rules for every session and subagent:
 
 - The `/factory` orchestrator runs in the MAIN checkout and is the only writer of
-  `factory/board.json` (always via the factory helper, never by hand).
+  `factory/board.json` (always via the `factory` tool, never by hand).
 - Each job `job-NNN-<slug>` has its own git worktree `.factory-worktrees/<job-id>/` on
   branch `factory/<job-id>`. Code for a job is edited ONLY inside that worktree, ONLY by
   that job's builder. Never edit the main checkout from a job.

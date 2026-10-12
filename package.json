@@ -1,10 +1,24 @@
 {
   "name": "omp-sw-factory",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "OMP plugin: a visual software factory (/factory) built on subagents, OpenSpec, git worktrees and markdown files.",
   "private": true,
   "license": "MIT",
+  "type": "module",
   "keywords": ["omp", "oh-my-pi", "skill", "openspec", "worktree"],
-  "files": ["agents", "commands", "skills", "README.md"],
-  "omp": {}
+  "files": ["agents", "commands", "skills", "src", "templates", "README.md"],
+  "engines": { "node": ">=23.6" },
+  "omp": {
+    "extensions": ["./src/index.ts"]
+  },
+  "scripts": {
+    "test": "node --test tests/*.test.ts",
+    "typecheck": "tsc",
+    "check": "tsc && node --test tests/*.test.ts",
+    "factory": "node src/cli.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.0"
+  }
 }

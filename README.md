@@ -11,15 +11,21 @@ feature → queued → OpenSpec propose → builder ⇄ 4 reviewers (max 2 round
 
 ## Install (once)
 
-Needs `omp`, `git`, `python3` (3.10+) and `openspec` (`npm i -g @fission-ai/openspec`).
+Needs `omp`, `git` and `openspec` (`npm i -g @fission-ai/openspec`). No build step: OMP
+loads the TypeScript extension directly.
 
 ```bash
 ./install.sh            # links this package as an OMP plugin: /factory in every repo
 ./install.sh ~/code/app # or: copy into ~/code/app/.omp/ (pinned to that repo)
 ```
 
-`./install.sh` runs `omp plugin link <this dir>`, so edits here are live everywhere.
-To remove it: `omp plugin uninstall omp-sw-factory`.
+`./install.sh` runs `omp plugin link <this dir>`, so edits here are live everywhere (restart
+`omp` to reload the extension). Turn it off with `omp plugin disable omp-sw-factory`
+(`omp plugin uninstall` needs `bun` on `PATH`).
+
+The pinned mode copies the skill, agents and command into `<repo>/.omp/` and the
+extension into `<repo>/.omp/extensions/sw-factory/`; commit them to share the factory
+with everyone who opens that repo in OMP.
 
 ## Use (per repo)
 
@@ -46,8 +52,10 @@ different repos at the same time.
 |---|---|
 | `commands/factory.md` | the `/factory` slash command (loads the skill) |
 | `skills/factory/SKILL.md` | the orchestrator's loop: edit this to change the factory |
-| `skills/factory/scripts/factory.py` | stdlib helper for exact work: board.json, ids, worktrees, ports, rounds, serial merge |
-| `skills/factory/templates/` | `dashboard.html`, `backlog.md`, the `AGENTS.md` section |
+| `src/index.ts` | OMP extension: registers the `factory` tool (main session only; subagents are refused) |
+| `src/factory.ts` | the exact work behind it: board.json, ids, worktrees, ports, rounds, serial merge |
+| `src/cli.ts` | the same actions from a shell, for debugging: `node src/cli.ts status` |
+| `templates/` | `dashboard.html`, `backlog.md`, the `AGENTS.md` section |
 | `agents/` | `builder`, `review-security`, `review-ux`, `review-ui`, `review-code`, `approver` |
 
 In a target repo the factory creates:
@@ -84,6 +92,9 @@ and collect them with `wait`.
 
 ## Develop
 
+Node 23.6+ runs the TypeScript sources directly (OMP itself runs them under Bun).
+
 ```bash
-uv run pytest && uv run ruff check . && uv run ruff format --check . && uv run mypy
+npm install          # typescript + @types/node, dev only
+npm run check        # tsc --noEmit, then node --test tests/*.test.ts
 ```
