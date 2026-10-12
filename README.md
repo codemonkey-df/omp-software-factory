@@ -1,4 +1,4 @@
-# omp-sw-factory
+# omp-software-factory
 
 A small, visual software factory for [oh-my-pi](https://omp.sh) (OMP): one `/factory`
 skill orchestrates subagents, [OpenSpec](https://github.com/Fission-AI/OpenSpec) specs,
@@ -9,6 +9,18 @@ job → queued → OpenSpec propose → builder ⇄ 4 reviewers (max 2 rounds) �
                                    (slow)   security/ux/ui/code          (slow)    rebase onto base, test, archive,
                                                                                     then stack onto base OR hand off
 ```
+
+## Dashboard
+
+`/factory dashboard` serves a live board from `factory/board.json`. Stages run left to right;
+jobs show type, branch → base, port, and per-round reviewer chips (security / ux / ui / code).
+
+![Factory dashboard — stage columns and ready lane](docs/dashboard-layout.png)
+
+Click a job to open its drawer: OpenSpec artifacts, `build.md`, and every review file for
+that round.
+
+![Job detail drawer — proposal, design, tasks, and review rounds](docs/job-detail.png)
 
 ## Install (once)
 
