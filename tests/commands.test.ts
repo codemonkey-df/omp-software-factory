@@ -72,6 +72,20 @@ describe("completions", () => {
     assert.equal(completeFactory("status ", board), null);
   });
 
+  test("hides another session's jobs from autocomplete", () => {
+    const scoped = {
+      jobs: [
+        { ...jobOf("job-001-a", "needs-human"), session_id: "sess-a" },
+        { ...jobOf("job-002-b", "needs-human"), session_id: "sess-b" },
+        jobOf("job-003-c", "needs-human"),
+      ],
+    } as Board;
+    assert.deepEqual(completeFactory("approve ", scoped, "sess-a")?.map((i) => i.value), [
+      "approve job-001-a ",
+      "approve job-003-c ",
+    ]);
+  });
+
   test("finds the board from a subdirectory", () => {
     const root = mkdtempSync(join(tmpdir(), "factory-cmd-"));
     mkdirSync(join(root, "factory"));
@@ -104,5 +118,25 @@ describe("registered commands", () => {
     assert.equal(sent.length, 0);
     assert.match(notes[0]!, /\/factory init/);
     assert.equal(notes[1], "usage: /factory approve <job-id>");
+  });
+
+  test("completions use the command context session id", async () => {
+    const root = mkdtempSync(join(tmpdir(), "factory-cmd-session-"));
+    mkdirSync(join(root, "factory"));
+    writeFileSync(
+      join(root, "factory", "board.json"),
+      JSON.stringify({
+        jobs: [
+          { ...jobOf("job-001-a", "needs-human"), session_id: "sess-a" },
+          { ...jobOf("job-002-b", "needs-human"), session_id: "sess-b" },
+        ],
+      }),
+    );
+    const items = await commands.get("factory")!.getArgumentCompletions!("approve ", {
+      cwd: root,
+      ui: ctx.ui,
+      sessionManager: { getSessionId: () => "sess-a" },
+    });
+    assert.deepEqual(items?.map((i) => i.value), ["approve job-001-a "]);
   });
 });

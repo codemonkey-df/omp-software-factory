@@ -55,8 +55,13 @@ function required<T>(value: T | undefined, name: string, action: string): T {
 }
 
 /** Execute one action in the repo containing `cwd`; returns a JSON-serialisable result. */
-export async function runAction(params: ActionParams, cwd: string, signal?: AbortSignal): Promise<unknown> {
-  const fac = await Factory.fromCwd(cwd);
+export async function runAction(
+  params: ActionParams,
+  cwd: string,
+  signal?: AbortSignal,
+  sessionId?: string,
+): Promise<unknown> {
+  const fac = await Factory.fromCwd(cwd, sessionId);
   const { action } = params;
   const id = (): string => required(params.id, "id", action);
   const baseBranch = params.base_branch ?? params.main_branch;

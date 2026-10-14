@@ -75,7 +75,7 @@ export default function factoryExtension(pi: ExtensionAPI): void {
         return text({ ok: false, error: "only the /factory orchestrator (main session) may call the factory tool" });
       }
       try {
-        return text(await runAction(params, ctx.cwd, signal));
+        return text(await runAction(params, ctx.cwd, signal, ctx.sessionManager?.getSessionId()));
       } catch (err) {
         if (err instanceof FactoryError) return text({ ok: false, error: err.message });
         throw err;

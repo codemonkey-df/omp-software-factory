@@ -14,6 +14,13 @@ const git = (cwd: string, ...args: string[]): string =>
 const run = (repo: string, action: ActionParams["action"], fields: Omit<ActionParams, "action"> = {}) =>
   runAction({ action, ...fields }, repo) as Promise<Record<string, any>>;
 
+const runAs = (
+  repo: string,
+  sessionId: string,
+  action: ActionParams["action"],
+  fields: Omit<ActionParams, "action"> = {},
+) => runAction({ action, ...fields }, repo, undefined, sessionId) as Promise<Record<string, any>>;
+
 const board = (repo: string): Board => JSON.parse(readFileSync(join(repo, "factory", "board.json"), "utf8"));
 const job = (repo: string, id: string): Job => board(repo).jobs.find((j) => j.id === id)!;
 const newId = async (repo: string, title: string): Promise<string> => (await run(repo, "new", { title })).id;
@@ -454,5 +461,87 @@ describe("integration modes", () => {
     assert.equal(git(wt, "status", "--porcelain"), "");
     assert.equal(git(repo, "ls-tree", "--name-only", "main", "openspec"), "");
     assert.ok(git(repo, "ls-tree", "-r", "--name-only", job(repo, id).branch).includes("openspec/specs/greeting/spec.md"));
+  });
+});
+
+describe("session isolation", () => {
+  test("two sessions in the same repo do not see each other's jobs", async () => {
+    const a = await runAs(repo, "sess-a", "new", { title: "session-a-widget" });
+    const beforeB = await runAs(repo, "sess-b", "status");
+    assert.equal(beforeB.jobs.length, 0);
+
+    const b = await runAs(repo, "sess-b", "new", { title: "session-b-export" });
+    const statusA = await runAs(repo, "sess-a", "status");
+    const statusB = await runAs(repo, "sess-b", "status");
+    assert.deepEqual(
+      statusA.jobs.map((j: { id: string }) => j.id),
+      [a.id],
+    );
+    assert.deepEqual(
+      statusB.jobs.map((j: { id: string }) => j.id),
+      [b.id],
+    );
+    assert.equal(job(repo, a.id).session_id, "sess-a");
+    assert.equal(job(repo, b.id).session_id, "sess-b");
+    assert.equal(board(repo).jobs.length, 2);
+    assert.equal((await run(repo, "status")).jobs.length, 2);
+  });
+
+  test("one session still sees all of its own jobs", async () => {
+    await runAs(repo, "sess-a", "new", { title: "one" });
+    await runAs(repo, "sess-a", "new", { title: "two" });
+    assert.equal((await runAs(repo, "sess-a", "status")).jobs.length, 2);
+  });
+
+  test("cross-session set is refused", async () => {
+    const a = await runAs(repo, "sess-a", "new", { title: "a" });
+    await assert.rejects(runAs(repo, "sess-b", "set", { id: a.id, stage: "needs-human" }), /another OMP session/);
+    assert.equal(job(repo, a.id).stage, "queued");
+  });
+
+  test("start slots are counted per session", async () => {
+    await run(repo, "parallel", { n: 1 });
+    const a1 = await runAs(repo, "sess-a", "new", { title: "a1" });
+    const a2 = await runAs(repo, "sess-a", "new", { title: "a2" });
+    const b1 = await runAs(repo, "sess-b", "new", { title: "b1" });
+    const startedA = await runAs(repo, "sess-a", "start", { skip_install: true });
+    assert.deepEqual(
+      startedA.started.map((j: Job) => j.id),
+      [a1.id],
+    );
+    assert.equal(job(repo, a2.id).stage, "queued");
+    const startedB = await runAs(repo, "sess-b", "start", { skip_install: true });
+    assert.deepEqual(
+      startedB.started.map((j: Job) => j.id),
+      [b1.id],
+    );
+    assert.equal(job(repo, b1.id).stage, "spec");
+  });
+
+  test("legacy jobs without session_id stay visible to every session", async () => {
+    const id = await newId(repo, "legacy");
+    assert.equal(job(repo, id).session_id, undefined);
+    assert.equal((await runAs(repo, "sess-a", "status")).jobs.length, 1);
+    await runAs(repo, "sess-a", "set", { id, note: "claimed" });
+    assert.equal(job(repo, id).note, "claimed");
+  });
+
+  test("merge without id skips another session's queue head", async () => {
+    const a = await runAs(repo, "sess-a", "new", { title: "alpha" });
+    const b = await runAs(repo, "sess-b", "new", { title: "beta" });
+    await runAs(repo, "sess-a", "start", { skip_install: true });
+    await runAs(repo, "sess-b", "start", { skip_install: true });
+    builderCommit(repo, a.id, "a.txt", "a\n");
+    builderCommit(repo, b.id, "b.txt", "b\n");
+    await runAs(repo, "sess-a", "enqueue", { id: a.id });
+    await runAs(repo, "sess-b", "enqueue", { id: b.id });
+    assert.deepEqual(board(repo).merge_queue, [a.id, b.id]);
+    assert.deepEqual((await runAs(repo, "sess-b", "status")).merge_queue, [b.id]);
+
+    const merged = await runAs(repo, "sess-b", "merge");
+    assert.equal(merged.ok, true);
+    assert.equal(merged.id, b.id);
+    assert.equal(job(repo, a.id).stage, "merge-queue");
+    assert.equal(job(repo, b.id).stage, "merged");
   });
 });

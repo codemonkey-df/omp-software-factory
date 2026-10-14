@@ -100,6 +100,8 @@ export interface Job {
   merged_at?: string;
   ready_at?: string;
   pushed?: boolean;
+  /** OMP session that created the job; omitted on CLI/legacy boards. */
+  session_id?: string;
 }
 
 export interface Board {
@@ -186,29 +188,41 @@ function oneOf<T extends string>(value: string, allowed: readonly T[], what: str
   return value as T;
 }
 
+/**
+ * Whether a job is in this OMP session's view. No session (CLI) sees everything.
+ * Jobs without `session_id` stay visible so older boards keep working.
+ */
+export function sessionOwnsJob(job: Pick<Job, "session_id">, sessionId?: string): boolean {
+  if (!sessionId) return true;
+  return job.session_id === undefined || job.session_id === sessionId;
+}
+
 /** All factory operations against one main checkout. */
 export class Factory {
   readonly root: string;
   readonly state: string;
   readonly boardPath: string;
   readonly jobsDir: string;
+  /** When set, status/start/merge/mutations only see jobs tagged with this OMP session. */
+  readonly sessionId?: string;
 
-  constructor(root: string) {
+  constructor(root: string, sessionId?: string) {
     this.root = existsSync(root) ? realpathSync(root) : root;
     this.state = join(root, "factory");
     this.boardPath = join(this.state, "board.json");
     this.jobsDir = join(this.state, "jobs");
+    this.sessionId = sessionId;
   }
 
   /** Locate the main checkout from any directory inside the repo; refuse worktrees. */
-  static async fromCwd(cwd: string): Promise<Factory> {
+  static async fromCwd(cwd: string, sessionId?: string): Promise<Factory> {
     const top = await git(cwd, "rev-parse", "--show-toplevel");
     const common = await git(top, "rev-parse", "--path-format=absolute", "--git-common-dir");
     const mainRoot = basename(common) === ".git" ? dirname(common) : top;
     if (realpathSync(mainRoot) !== realpathSync(top)) {
       throw new FactoryError(`run the factory from the main checkout (${mainRoot}), not a worktree`);
     }
-    return new Factory(top);
+    return new Factory(top, sessionId);
   }
 
   // ----- board -----------------------------------------------------------------------
@@ -241,6 +255,27 @@ export class Factory {
     const job = board.jobs.find((j) => j.id === id);
     if (!job) throw new FactoryError(`unknown job ${id}`);
     return job;
+  }
+
+  private isVisible(job: Job): boolean {
+    return sessionOwnsJob(job, this.sessionId);
+  }
+
+  private visibleJobs(board: Board): Job[] {
+    return board.jobs.filter((j) => this.isVisible(j));
+  }
+
+  private visibleQueue(board: Board): string[] {
+    return board.merge_queue.filter((id) => {
+      const job = board.jobs.find((j) => j.id === id);
+      return job !== undefined && this.isVisible(job);
+    });
+  }
+
+  private assertOwned(job: Job): void {
+    if (!this.isVisible(job)) {
+      throw new FactoryError(`${job.id} belongs to another OMP session`);
+    }
   }
 
   private touch(job: Job, fields: Partial<Job> = {}): Job {
@@ -418,6 +453,7 @@ export class Factory {
       created: now(),
       updated: now(),
     };
+    if (this.sessionId) job.session_id = this.sessionId;
     board.jobs.push(job);
     this.save(board);
     return job;
@@ -427,10 +463,11 @@ export class Factory {
   async start(opts: { install?: boolean; signal?: AbortSignal } = {}) {
     const { install = true, signal } = opts;
     const board = this.load();
-    let active = board.jobs.filter((j) => ACTIVE_STAGES.has(j.stage)).length;
+    const mine = this.visibleJobs(board);
+    let active = mine.filter((j) => ACTIVE_STAGES.has(j.stage)).length;
     const started: Job[] = [];
     const warnings: { id: string; install: string }[] = [];
-    for (const job of board.jobs) {
+    for (const job of mine) {
       if (active >= board.max_parallel) break;
       if (job.stage !== "queued") continue;
       const wt = join(this.root, job.worktree);
@@ -447,7 +484,9 @@ export class Factory {
       this.save(board);
     }
     this.save(board);
-    const stillQueued = board.jobs.filter((j) => j.stage === "queued").map((j) => j.id);
+    const stillQueued = this.visibleJobs(board)
+      .filter((j) => j.stage === "queued")
+      .map((j) => j.id);
     return { started, still_queued: stillQueued, warnings };
   }
 
@@ -455,6 +494,7 @@ export class Factory {
   set(id: string, opts: { stage?: string; round?: number; note?: string; files?: string[] }): Job {
     const board = this.load();
     const job = this.job(board, id);
+    this.assertOwned(job);
     if (opts.stage !== undefined) {
       job.stage = oneOf(opts.stage, STAGES, "stage");
       if (opts.stage !== "merge-queue") board.merge_queue = board.merge_queue.filter((j) => j !== id);
@@ -471,6 +511,7 @@ export class Factory {
   round(id: string, n: number) {
     const board = this.load();
     const job = this.job(board, id);
+    this.assertOwned(job);
     const folder = join(this.jobsDir, id, `round-${n}`);
     mkdirSync(folder, { recursive: true });
     this.touch(job, { stage: "review", round: n, reviews: pendingReviews() });
@@ -487,6 +528,7 @@ export class Factory {
   collect(id: string) {
     const board = this.load();
     const job = this.job(board, id);
+    this.assertOwned(job);
     const relDir = `factory/jobs/${id}/round-${job.round}`;
     const verdicts = pendingReviews();
     for (const reviewer of REVIEWERS) {
@@ -519,6 +561,7 @@ export class Factory {
     }
     const board = this.load();
     const job = this.job(board, id);
+    this.assertOwned(job);
     this.addFile(job, rel);
     if (decision === "APPROVE") this.enqueueJob(board, job);
     else this.touch(job, { stage: "needs-human", note: "approver escalated" });
@@ -529,9 +572,11 @@ export class Factory {
   /** Put a job in the integration queue (/factory approve, and after a merge fix). */
   enqueue(id: string) {
     const board = this.load();
-    this.enqueueJob(board, this.job(board, id));
+    const job = this.job(board, id);
+    this.assertOwned(job);
+    this.enqueueJob(board, job);
     this.save(board);
-    return { id, merge_queue: board.merge_queue };
+    return { id, merge_queue: this.visibleQueue(board) };
   }
 
   private enqueueJob(board: Board, job: Job): void {
@@ -572,7 +617,8 @@ export class Factory {
 
   private async mergeLocked(id: string | undefined, signal?: AbortSignal) {
     const board = this.load();
-    const next = id ?? board.merge_queue[0];
+    if (id) this.assertOwned(this.job(board, id));
+    const next = id ?? this.visibleQueue(board)[0];
     if (!next) return { ok: true, merged: null, detail: "merge queue empty" };
     const job = this.job(board, next);
     const { integration, test, protected_branches: protectedBranches } = board.repo;
@@ -698,7 +744,7 @@ export class Factory {
       archived,
       worktree_removed: removed.code === 0,
       detail: removed.stderr.trim(),
-      merge_queue: board.merge_queue,
+      merge_queue: this.visibleQueue(board),
     };
   }
 
@@ -732,7 +778,7 @@ export class Factory {
       pushed,
       push_error: pushError || undefined,
       detail: `${job.branch} is rebased on ${job.base_branch}, tested and ready for human review`,
-      merge_queue: board.merge_queue,
+      merge_queue: this.visibleQueue(board),
     };
   }
 
@@ -777,13 +823,14 @@ export class Factory {
 
   status() {
     const board = this.load();
-    const active = board.jobs.filter((j) => ACTIVE_STAGES.has(j.stage)).length;
+    const jobs = this.visibleJobs(board);
+    const active = jobs.filter((j) => ACTIVE_STAGES.has(j.stage)).length;
     return {
       max_parallel: board.max_parallel,
       free_slots: Math.max(board.max_parallel - active, 0),
       repo: board.repo,
-      merge_queue: board.merge_queue,
-      jobs: board.jobs.map(({ id, type, stage, round, port, branch, base_branch, reviews, note }) => ({
+      merge_queue: this.visibleQueue(board),
+      jobs: jobs.map(({ id, type, stage, round, port, branch, base_branch, reviews, note, session_id }) => ({
         id,
         type,
         stage,
@@ -793,6 +840,7 @@ export class Factory {
         base_branch,
         reviews,
         note,
+        session_id,
       })),
     };
   }
@@ -804,8 +852,9 @@ export class Factory {
    */
   async cleanup() {
     const board = this.load();
+    const mine = this.visibleJobs(board);
     const detected: string[] = [];
-    for (const job of board.jobs) {
+    for (const job of mine) {
       if (job.stage !== "ready") continue;
       const merged = await sh(["git", "merge-base", "--is-ancestor", job.branch, `refs/heads/${job.base_branch}`], this.root);
       if (merged.code === 0) {
@@ -816,7 +865,7 @@ export class Factory {
     this.save(board);
     const removed: string[] = [];
     const failed: { id: string; error: string }[] = [];
-    for (const job of board.jobs) {
+    for (const job of mine) {
       const wt = join(this.root, job.worktree);
       if (job.stage !== "merged" || !existsSync(wt)) continue;
       const result = await sh(["git", "worktree", "remove", wt], this.root);
@@ -824,7 +873,9 @@ export class Factory {
       else failed.push({ id: job.id, error: result.stderr.trim() });
     }
     await git(this.root, "worktree", "prune");
-    const stillReady = board.jobs.filter((j) => j.stage === "ready").map((j) => j.branch);
+    const stillReady = this.visibleJobs(board)
+      .filter((j) => j.stage === "ready")
+      .map((j) => j.branch);
     return { merged_detected: detected, removed, failed, still_ready: stillReady };
   }
 }

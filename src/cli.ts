@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * Debug CLI for the factory actions, outside OMP:
+ * Debug CLI for the factory actions, outside OMP (unscoped: sees every session's jobs):
  *   node src/cli.ts status
  *   node src/cli.ts set '{"id": "job-001-x", "stage": "needs-human"}'
  */

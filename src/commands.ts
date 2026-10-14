@@ -8,6 +8,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 
 import type { Board, Job, Stage } from "./factory.ts";
+import { sessionOwnsJob } from "./factory.ts";
 import type { CommandContext, CompletionItem, ExtensionAPI } from "./omp-types.ts";
 
 export const SHORT_PREFIX = "fx";
@@ -102,10 +103,16 @@ export function findBoard(cwd: string): Board | null {
   }
 }
 
-function jobItems(sub: Subcommand, typedId: string, board: Board | null, valuePrefix: string): CompletionItem[] {
+function jobItems(
+  sub: Subcommand,
+  typedId: string,
+  board: Board | null,
+  valuePrefix: string,
+  sessionId?: string,
+): CompletionItem[] {
   const stages = new Set(sub.jobStages);
   return (board?.jobs ?? [])
-    .filter((j: Job) => stages.has(j.stage) && j.id.startsWith(typedId))
+    .filter((j: Job) => sessionOwnsJob(j, sessionId) && stages.has(j.stage) && j.id.startsWith(typedId))
     .map((j) => ({
       label: j.id,
       value: `${valuePrefix}${j.id} `,
@@ -114,7 +121,7 @@ function jobItems(sub: Subcommand, typedId: string, board: Board | null, valuePr
 }
 
 /** Completions for the text typed after `/factory `. */
-export function completeFactory(typed: string, board: Board | null): CompletionItem[] | null {
+export function completeFactory(typed: string, board: Board | null, sessionId?: string): CompletionItem[] | null {
   const space = typed.indexOf(" ");
   if (space === -1) {
     const prefix = typed.toLowerCase();
@@ -128,14 +135,19 @@ export function completeFactory(typed: string, board: Board | null): CompletionI
   const sub = byName.get(typed.slice(0, space).toLowerCase());
   const rest = typed.slice(space + 1);
   if (!sub?.jobStages || rest.includes(" ")) return null;
-  const items = jobItems(sub, rest, board, `${sub.name} `);
+  const items = jobItems(sub, rest, board, `${sub.name} `, sessionId);
   return items.length ? items : null;
 }
 
 /** Completions for the text typed after `/fx:<name> `. */
-export function completeShort(sub: Subcommand, typed: string, board: Board | null): CompletionItem[] | null {
+export function completeShort(
+  sub: Subcommand,
+  typed: string,
+  board: Board | null,
+  sessionId?: string,
+): CompletionItem[] | null {
   if (!sub.jobStages || typed.includes(" ")) return null;
-  const items = jobItems(sub, typed, board, "");
+  const items = jobItems(sub, typed, board, "", sessionId);
   return items.length ? items : null;
 }
 
@@ -147,12 +159,22 @@ export function orchestratorPrompt(request: string): string {
   ].join("\n");
 }
 
+const sessionOf = (ctx?: CommandContext): string | undefined => ctx?.sessionManager?.getSessionId();
+
 /** Register `/factory` and the `/fx:*` shortcuts. */
 export function registerCommands(pi: ExtensionAPI): void {
   let cwd = process.cwd();
+  let sessionId: string | undefined;
+
+  const remember = (ctx?: CommandContext): string | undefined => {
+    if (ctx?.cwd) cwd = ctx.cwd;
+    const id = sessionOf(ctx);
+    if (id !== undefined) sessionId = id;
+    return id ?? sessionId;
+  };
 
   const run = (args: string, ctx: CommandContext): void => {
-    cwd = ctx.cwd;
+    remember(ctx);
     const parsed = toRequest(args);
     if ("help" in parsed) ctx.ui.notify(helpText(), "info");
     else if ("error" in parsed) ctx.ui.notify(parsed.error, "warning");
@@ -161,14 +183,22 @@ export function registerCommands(pi: ExtensionAPI): void {
 
   pi.registerCommand("factory", {
     description: "Software factory: spec, build, review, approve, integrate (type a space for subcommands)",
-    getArgumentCompletions: (typed) => completeFactory(typed, findBoard(cwd)),
+    getArgumentCompletions: (typed, ctx) => {
+      const sid = remember(ctx);
+      return completeFactory(typed, findBoard(cwd), sid);
+    },
     handler: run,
   });
 
   for (const sub of SUBCOMMANDS) {
     pi.registerCommand(`${SHORT_PREFIX}:${sub.name}`, {
       description: `${sub.args ? `${sub.args} — ` : ""}${sub.description}`,
-      getArgumentCompletions: sub.jobStages ? (typed) => completeShort(sub, typed, findBoard(cwd)) : undefined,
+      getArgumentCompletions: sub.jobStages
+        ? (typed, ctx) => {
+            const sid = remember(ctx);
+            return completeShort(sub, typed, findBoard(cwd), sid);
+          }
+        : undefined,
       handler: (args, ctx) => run(`${sub.name} ${args}`, ctx),
     });
   }

@@ -21,9 +21,14 @@ export interface ToolResult {
   details?: unknown;
 }
 
+export interface SessionManager {
+  getSessionId(): string;
+}
+
 export interface ToolContext {
   cwd: string;
   agent?: { kind: "main" | "sub"; name?: string };
+  sessionManager?: SessionManager;
 }
 
 export interface ToolDefinition<P> {
@@ -52,11 +57,15 @@ export interface CommandContext {
   cwd: string;
   hasUI?: boolean;
   ui: { notify(message: string, level?: "info" | "warning" | "error"): void };
+  sessionManager?: SessionManager;
 }
 
 export interface CommandDefinition {
   description: string;
-  getArgumentCompletions?: (typed: string) => CompletionItem[] | null | Promise<CompletionItem[] | null>;
+  getArgumentCompletions?: (
+    typed: string,
+    ctx?: CommandContext,
+  ) => CompletionItem[] | null | Promise<CompletionItem[] | null>;
   handler(args: string, ctx: CommandContext): void | Promise<void>;
 }
 

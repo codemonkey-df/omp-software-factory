@@ -111,12 +111,18 @@ async function roundsHtml(job) {
 
 const defaultBase = () => board.repo?.base_branch ?? board.repo?.main_branch ?? "main";
 const baseOf = job => job.base_branch ?? defaultBase();
+function sessionBadge(id) {
+  if (!id) return "";
+  const last = String(id).split(/[/\\]/).pop() || String(id);
+  return last.length > 8 ? last.slice(0, 8) : last;
+}
 
 async function cardHtml(job) {
   const human = job.stage === "needs-human";
+  const session = sessionBadge(job.session_id);
   return `<div class="card ${human ? "human" : ""}" onclick="openDrawer('${job.id}')">
     <div class="id"><span class="type ${esc(job.type || "feature")}">${esc(job.type || "feature")}</span>${esc(job.id)}</div>
-    <div class="sub">${esc(job.branch)} → ${esc(baseOf(job))} · :${job.port}</div>
+    <div class="sub">${esc(job.branch)} → ${esc(baseOf(job))} · :${job.port}${session ? ` · session ${esc(session)}` : ""}</div>
     ${job.note ? `<div class="note">${esc(job.note)}</div>` : ""}
     ${await roundsHtml(job)}</div>`;
 }
@@ -169,7 +175,8 @@ function renderDrawer() {
   const job = board.jobs.find(j => j.id === openJob);
   if (!job) return closeDrawer();
   document.getElementById("d-title").textContent = `${job.id} — ${job.title}`;
-  document.getElementById("d-sub").textContent = `${job.type || "feature"} · ${job.stage} · round ${job.round} · ${job.branch} → ${baseOf(job)} · ${job.worktree} · :${job.port}`;
+  const session = sessionBadge(job.session_id);
+  document.getElementById("d-sub").textContent = `${job.type || "feature"} · ${job.stage} · round ${job.round} · ${job.branch} → ${baseOf(job)} · ${job.worktree} · :${job.port}${session ? ` · session ${session}` : ""}`;
   if (!openFile && job.files.length) openFile = job.files[0];
   document.getElementById("d-files").innerHTML = job.files.map(f =>
     `<span class="pill ${f === openFile ? "on" : ""}" title="${esc(f)}" onclick="showFile('${esc(f)}')">${esc(fileLabel(f))}</span>`

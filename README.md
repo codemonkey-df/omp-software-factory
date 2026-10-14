@@ -61,7 +61,11 @@ cd ~/code/app && omp
 ```
 
 Each repo has its own `factory/` state, so separate OMP instances can run factories for
-different repos at the same time.
+different repos at the same time. In the **same** repo (e.g. two `omp` consoles in
+different tmux panes), each OMP session only sees its own jobs — so parallel features
+do not mix in the console. Several jobs in one session stay visible together. The
+dashboard still shows every job (with a short session badge); the debug CLI
+(`node src/cli.ts`) sees all jobs.
 
 ### Discovering commands
 
